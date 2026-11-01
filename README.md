@@ -3,6 +3,8 @@
 A React + Django REST Framework app that helps a truck driver pick the safest of three routes given
 the weather at each checkpoint **when the truck gets there**, the load weight, and travel time.
 
+**Live app:** https://haulguard-kappa.vercel.app (the API runs on Render's free tier, so the first request after it has been idle can take ~50 s).
+
 Stack: React 19 + TypeScript + Tailwind + Leaflet (frontend), Django 6 + DRF (backend).
 External APIs (no keys needed): **OSRM** for routing, **Open-Meteo** for geocoding and hourly forecasts.
 
@@ -128,6 +130,17 @@ npm run dev
 ```
 
 Open `http://localhost:5173` in your browser. Vite proxies `/api/*` requests directly to `http://127.0.0.1:8000`.
+
+---
+
+## Deployment (free tier)
+
+**Backend: Render.** `render.yaml` is a Render Blueprint: gunicorn, debug off, a generated secret key, migrations on start.
+In Render: *New -> Blueprint ->* this repo. `CORS_ALLOWED_ORIGINS` in `render.yaml` must list the frontend URL.
+The free instance sleeps after 15 minutes idle (first request then takes ~50 s), and its SQLite plan history resets on restart.
+
+**Frontend: Vercel.** Import the repo with root directory `frontend` (Vite preset) and set
+`VITE_API_BASE_URL=https://<your-render-service>.onrender.com/api`.
 
 ---
 
