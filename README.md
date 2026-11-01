@@ -3,7 +3,7 @@
 A React + Django REST Framework app that helps a truck driver pick the safest of three routes given
 the weather at each checkpoint **when the truck gets there**, the load weight, and travel time.
 
-**Live app:** https://haulguard-kappa.vercel.app (the API runs on Render's free tier, so the first request after it has been idle can take ~50 s).
+**Live app:** https://haulguard-routes.vercel.app (the API runs on Render's free tier, so the first request after it has been idle can take ~50 s).
 
 Stack: React 19 + TypeScript + Tailwind + Leaflet (frontend), Django 6 + DRF (backend).
 External APIs (no keys needed): **OSRM** for routing, **Open-Meteo** for geocoding and hourly forecasts.
