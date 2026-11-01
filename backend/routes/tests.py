@@ -307,6 +307,16 @@ class RankingTieBreakTests(RouteRecommendationAndSafetyScoreTests):
         ranked = rank_and_explain_routes([breezy_fast, calm_slow], 20000, "dry_van")
         self.assertEqual(ranked[0]["id"], "slow")
 
+        # A negligible average-risk edge (<0.1 on the 1-5 scale) must not outweigh a much shorter trip.
+        slightly_calmer = self._make_mock_route(
+            "calmer", "C", 900.0, [10.0] * 39 + [26.0], 20000
+        )
+        slightly_breezier = self._make_mock_route(
+            "breezier", "B", 600.0, [10.0] * 38 + [26.0, 26.0], 20000
+        )
+        ranked = rank_and_explain_routes([slightly_calmer, slightly_breezier], 20000, "dry_van")
+        self.assertEqual(ranked[0]["id"], "breezier")
+
         a = self._make_mock_route("a", "A", 260.0, [10.0, 10.0, 10.0, 10.0], 20000)
         b = self._make_mock_route("b", "B", 240.0, [10.0, 10.0, 10.0, 10.0], 20000)
         ranked = rank_and_explain_routes([a, b], 20000, "dry_van")

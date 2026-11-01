@@ -291,7 +291,8 @@ export function RouteInsight({
       <div className="border-t border-line px-4 py-3">
         <h3 className="text-sm font-semibold">Compare the set</h3>
         <p className="mt-1 text-xs text-muted">
-          Ordered by fewest severe and no-travel miles, then high-risk miles, then average risk, then travel time.
+          Ordered by fewest no-travel and severe miles, then high-risk miles, then average risk (within
+          0.1 counts as equal), then travel time.
         </p>
       </div>
       <div className="overflow-x-auto">

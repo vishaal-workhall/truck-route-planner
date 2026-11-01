@@ -526,13 +526,17 @@ def rank_and_explain_routes(
     # 2. Fewest High miles
     # 3. Lowest average risk
     # 4. Shortest travel times
+    # Average risk within 0.1 (on the 1-5 scale) of the best route counts as a tie, so a
+    # negligible risk edge cannot outweigh a much shorter trip; travel time then decides.
+    AVG_RISK_TOLERANCE = 0.1
+    best_avg = min(r["safety"]["average_risk_score"] for r in routes)
     sorted_routes = sorted(
         routes,
         key=lambda r: (
             round(r["safety"]["risk_miles"]["no_travel_miles"], 1),
             round(r["safety"]["risk_miles"]["severe_miles"], 1),
             round(r["safety"]["risk_miles"]["high_miles"], 1),
-            round(r["safety"]["average_risk_score"], 2),
+            int((r["safety"]["average_risk_score"] - best_avg) / AVG_RISK_TOLERANCE + 1e-9),
             round(r["duration_minutes"], 1),
         ),
     )
@@ -550,6 +554,15 @@ def rank_and_explain_routes(
 
     recommended = sorted_routes[0]
     fastest = min(sorted_routes, key=lambda r: r["duration_minutes"])
+
+    rec_miles = recommended["safety"]["risk_miles"]
+    fast_miles = fastest["safety"]["risk_miles"]
+    if rec_miles["severe_plus_no_travel_miles"] < fast_miles["severe_plus_no_travel_miles"]:
+        avoided_on_fastest = "Severe and No-Travel weather"
+    elif rec_miles["high_miles"] < fast_miles["high_miles"]:
+        avoided_on_fastest = "High-risk weather"
+    else:
+        avoided_on_fastest = "weather risk"
 
     for route in sorted_routes:
         rm = route["safety"]["risk_miles"]
@@ -648,7 +661,7 @@ def rank_and_explain_routes(
                 key_reasons.append(
                     {
                         "type": "info",
-                        "text": f"Adds {format_minutes(time_diff_vs_fastest)} over the fastest route ({fastest['name']}) to bypass hazardous weather.",
+                        "text": f"Adds {format_minutes(time_diff_vs_fastest)} over the fastest route ({fastest['name']}) to reduce {avoided_on_fastest}.",
                     }
                 )
 
@@ -744,7 +757,7 @@ def rank_and_explain_routes(
             "tradeoff_headline": (
                 "Recommended: Optimal balance of safety and travel time"
                 if route["is_recommended"] and time_diff_vs_fastest <= 5
-                else f"Recommended: +{format_minutes(time_diff_vs_fastest)} vs fastest to avoid severe weather"
+                else f"Recommended: +{format_minutes(time_diff_vs_fastest)} vs fastest to reduce {avoided_on_fastest}"
                 if route["is_recommended"]
                 else f"{format_minutes(time_diff_vs_rec)} faster, but {abs(score_diff_vs_rec)} pts lower safety score"
                 if time_diff_vs_rec < 0

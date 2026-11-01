@@ -18,7 +18,7 @@ External APIs (no keys needed): **OSRM** for routing, **Open-Meteo** for geocodi
 | 3 route options from a routing API | OSRM alternatives. If OSRM returns fewer than 3, it is re-queried through waypoints on either side of the corridor. Only if that also fails is a corridor estimated, and it is labelled "Estimated corridor (no road data)". |
 | Weather every 10 / 25 / 50 miles at the truck's ETA | Checkpoints are placed exactly every N road miles (no cap). Each checkpoint gets its own Open-Meteo hourly series, and the value at the hour nearest its ETA is used. |
 | Risk from the rules | `backend/routes/services/risk_engine.py`. Wind, rain and snow are classified separately, the load rules are applied to wind, and the checkpoint takes the worst of the three. |
-| Recommend the best route | Routes are sorted by: No-Travel miles, then Severe miles, then High miles, then mile-weighted average risk, then travel time. |
+| Recommend the best route | Routes are sorted by: No-Travel miles, then Severe miles, then High miles, then mile-weighted average risk (within 0.1 of the best counts as equal), then travel time. |
 | Map with routes, checkpoints, risk, ETAs, summaries | The recommended/selected route is drawn in its checkpoints' risk colours; checkpoint popups show ETA, weather and any load-rule escalation; route cards and the comparison table summarise each route. |
 | Weather heatmap with 0-48 h slider | Interpolated weather field (Risk / Wind / Rain / Snow) over the corridor, re-rendered per forecast hour, with Play. |
 
@@ -41,6 +41,7 @@ Decisions where the brief is ambiguous:
 - **Wind = sustained 10 m wind speed.** Gusts are shown alongside but are not classified, because the table gives wind speed thresholds.
 - **Rain = Open-Meteo `rain + showers`.** Open-Meteo reports convective downpours under `showers`; using `rain` alone would miss thunderstorms.
 - **"Fewest Severe miles" counts No-Travel as worse than any amount of Severe.** A route with any No-Travel stretch can't legally be driven, so No-Travel miles are compared first, then Severe miles. If every route has No-Travel miles, the UI tells the driver to hold the load.
+- **Average-risk ties.** Average risk is a mile-weighted 1-5 score. Routes within 0.1 of the best are treated as equal, so travel time decides. Otherwise a 0.02 edge from one breezy checkpoint would beat a route 14 hours faster, and the brief asks to balance risk and travel time.
 - **Miles per checkpoint.** Each checkpoint represents the road from half-way to the previous checkpoint to half-way to the next, so risk miles always sum to the route length.
 
 ## ETA model
