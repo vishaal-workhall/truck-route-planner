@@ -33,6 +33,7 @@ INSTALLED_APPS = [
 MIDDLEWARE = [
     "corsheaders.middleware.CorsMiddleware",
     "django.middleware.security.SecurityMiddleware",
+    "django.middleware.gzip.GZipMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
@@ -105,5 +106,3 @@ OPEN_METEO_FORECAST_URL = os.getenv(
 OPEN_METEO_GEOCODE_URL = os.getenv(
     "OPEN_METEO_GEOCODE_URL", "https://geocoding-api.open-meteo.com/v1/search"
 )
-OPENROUTESERVICE_API_KEY = os.getenv("OPENROUTESERVICE_API_KEY", "")
-DEFAULT_WEATHER_MODE = os.getenv("DEFAULT_WEATHER_MODE", "auto")

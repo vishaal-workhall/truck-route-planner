@@ -89,7 +89,7 @@ def nearest_hub_label(lat: float, lng: float) -> str:
         return f"Near {best_name}"
     if best_dist <= 85.0:
         return f"{best_dist:.0f} mi from {best_name}"
-    return f"{lat:.2f}N, {abs(lng):.2f}W"
+    return f"{abs(lat):.2f}{'N' if lat >= 0 else 'S'}, {abs(lng):.2f}{'E' if lng >= 0 else 'W'}"
 
 
 def geocode_location(query: str) -> Dict[str, Any]:
@@ -141,32 +141,49 @@ def geocode_location(query: str) -> Dict[str, Any]:
                 "source": "freight_hub_directory",
             }
 
-    # 3. Query Open-Meteo Geocoding API
+    # 3. Query Open-Meteo Geocoding API (any country, including India)
     search_term = cleaned.split(",")[0].strip()
-    state_hint = cleaned.split(",")[1].strip().upper() if "," in cleaned else ""
+    region_hint = cleaned.split(",")[1].strip() if "," in cleaned else ""
+    country_codes = {
+        "india": "IN",
+        "usa": "US",
+        "united states": "US",
+    }
+    country_code_hint = country_codes.get(region_hint.lower(), "")
+    params: Dict[str, Any] = {
+        "name": search_term,
+        "count": 8,
+        "language": "en",
+        "format": "json",
+    }
+    if country_code_hint:
+        params["countryCode"] = country_code_hint
     try:
         resp = requests.get(
             settings.OPEN_METEO_GEOCODE_URL,
-            params={"name": search_term, "count": 5, "language": "en", "format": "json"},
+            params=params,
             timeout=4.0,
         )
         if resp.status_code == 200:
             results = resp.json().get("results") or []
             if results:
                 chosen = results[0]
-                if state_hint:
+                region_upper = region_hint.upper()
+                if region_upper and not country_code_hint:
                     for candidate in results:
                         admin1 = (candidate.get("admin1") or "").upper()
-                        if state_hint in admin1 or admin1.startswith(state_hint):
+                        if region_upper in admin1 or admin1.startswith(region_upper):
                             chosen = candidate
                             break
                 admin1 = chosen.get("admin1", "")
                 country_code = chosen.get("country_code", "")
-                display_name = (
-                    f"{chosen['name']}, {admin1}"
-                    if admin1
-                    else f"{chosen['name']}, {country_code}"
-                )
+                country_name = chosen.get("country", "")
+                if admin1 and country_code and country_code != "US":
+                    display_name = f"{chosen['name']}, {admin1}, {country_name or country_code}"
+                elif admin1:
+                    display_name = f"{chosen['name']}, {admin1}"
+                else:
+                    display_name = f"{chosen['name']}, {country_name or country_code}"
                 return {
                     "name": display_name,
                     "lat": float(chosen["latitude"]),
@@ -177,7 +194,7 @@ def geocode_location(query: str) -> Dict[str, Any]:
         pass
 
     raise ValueError(
-        f"Could not resolve location '{query}'. Try a city and state such as 'Chicago, IL' or 'Denver, CO'."
+        f"Could not resolve location '{query}'. Try a city such as 'Mumbai' or 'Chicago, IL'."
     )
 
 
@@ -270,6 +287,13 @@ def _synthesize_corridor_geometry(
     return coords, road_miles, duration_minutes
 
 
+def _compass_side(d_lat: float, d_lng: float) -> str:
+    """Name the dominant compass direction of a (lat, lng) offset vector."""
+    if abs(d_lat) >= abs(d_lng):
+        return "Northern" if d_lat > 0 else "Southern"
+    return "Eastern" if d_lng > 0 else "Western"
+
+
 def fetch_three_routes(
     origin: Dict[str, Any], destination: Dict[str, Any]
 ) -> Tuple[List[Dict[str, Any]], str]:
@@ -286,11 +310,7 @@ def fetch_three_routes(
     lat2, lng2 = destination["lat"], destination["lng"]
     direct_miles = haversine_miles(lat1, lng1, lat2, lng2)
 
-    corridor_labels = [
-        "Primary Interstate Corridor",
-        "Northern Regional Bypass",
-        "Southern Express Corridor",
-    ]
+    corridor_labels = ["Primary corridor", "Alternative corridor", "Second alternative"]
 
     try:
         # 1. Primary OSRM call requesting up to 3 alternatives
@@ -327,9 +347,9 @@ def fetch_three_routes(
             deflection_deg = min(2.2, max(0.35, norm * 0.16))
 
             bypass_configs = [
-                (1.0, "Northern Highway Bypass"),
-                (-1.0, "Southern Corridor Alternative"),
-                (1.65, "Upper Regional Detour"),
+                (1.0, f"{_compass_side(perp_lat, perp_lng)} bypass"),
+                (-1.0, f"{_compass_side(-perp_lat, -perp_lng)} bypass"),
+                (1.65, f"Wide {_compass_side(perp_lat, perp_lng).lower()} detour"),
             ]
 
             for sign, bypass_label in bypass_configs:
@@ -380,7 +400,7 @@ def fetch_three_routes(
             dist_miles = round(max(dist_miles, base_dist * factor), 1)
             dur_minutes = round(max(dur_minutes, base_dur * factor), 1)
 
-        label = corridor_labels[idx % len(corridor_labels)]
+        label = "Estimated corridor (no road data)"
         raw_routes.append(
             {
                 "id": f"route_{idx + 1}",
@@ -395,11 +415,11 @@ def fetch_three_routes(
         if routing_source == "live_osrm" and len(raw_routes) <= 3:
             routing_source = "live_osrm" if all(r["source"] == "live_osrm" for r in raw_routes) else "hybrid_osrm"
 
-    # Downsample geometry for smooth map rendering (max ~180 points per polyline)
+    # Downsample geometry for map rendering (~500 points keeps checkpoints on the road)
     for route in raw_routes:
         geom = route["geometry"]
-        if len(geom) > 180:
-            step = max(1, len(geom) // 180)
+        if len(geom) > 500:
+            step = max(1, len(geom) // 500)
             sampled = geom[::step]
             if sampled[-1] != geom[-1]:
                 sampled.append(geom[-1])
@@ -408,16 +428,87 @@ def fetch_three_routes(
     return raw_routes[:3], routing_source
 
 
+# FMCSA property-carrying Hours-of-Service limits (single driver).
+HOS_BREAK_AFTER_DRIVING_MIN = 8 * 60
+HOS_BREAK_MIN = 30
+HOS_MAX_DRIVING_MIN = 11 * 60
+HOS_REST_MIN = 10 * 60
+
+
+def hos_schedule(driving_minutes: float) -> Tuple[float, List[Dict[str, Any]]]:
+    """
+    Convert pure driving time into elapsed trip time for a single driver under FMCSA HOS:
+    a 30-min break after 8 h of driving, and a 10-h rest after 11 h of driving.
+    A stop is only taken when more driving remains after it.
+
+    Returns (elapsed_minutes, stops) where each stop records the driving minute it starts at.
+    """
+    remaining = max(0.0, driving_minutes)
+    elapsed = 0.0
+    driven = 0.0
+    since_break = 0.0
+    since_rest = 0.0
+    stops: List[Dict[str, Any]] = []
+    while remaining > 1e-9:
+        chunk = min(
+            remaining,
+            HOS_BREAK_AFTER_DRIVING_MIN - since_break,
+            HOS_MAX_DRIVING_MIN - since_rest,
+        )
+        elapsed += chunk
+        driven += chunk
+        remaining -= chunk
+        since_break += chunk
+        since_rest += chunk
+        if remaining <= 1e-9:
+            break
+        if since_rest >= HOS_MAX_DRIVING_MIN:
+            kind, length = "10-hr rest", HOS_REST_MIN
+            since_rest = 0.0
+            since_break = 0.0
+        else:
+            kind, length = "30-min break", HOS_BREAK_MIN
+            since_break = 0.0
+        stops.append(
+            {
+                "kind": kind,
+                "at_driving_minutes": round(driven, 1),
+                "start_elapsed_minutes": round(elapsed, 1),
+                "duration_minutes": length,
+            }
+        )
+        elapsed += length
+    return elapsed, stops
+
+
+def hos_elapsed_minutes(driving_minutes: float) -> float:
+    """Elapsed minutes from departure until the truck has driven `driving_minutes`."""
+    return hos_schedule(driving_minutes)[0]
+
+
+def apply_hos_to_route(route: Dict[str, Any]) -> None:
+    """Store raw driving time and replace duration with HOS-compliant door-to-door time."""
+    driving = float(route["duration_minutes"])
+    elapsed, stops = hos_schedule(driving)
+    distance = float(route["distance_miles"])
+    for stop in stops:
+        stop["mile"] = round(distance * stop["at_driving_minutes"] / max(driving, 1e-6), 1)
+    route["driving_minutes"] = round(driving, 1)
+    route["duration_minutes"] = round(elapsed, 1)
+    route["hos_stops"] = stops
+
+
 def sample_route_checkpoints(
     geometry: List[List[float]],
     total_distance_miles: float,
-    total_duration_minutes: float,
+    driving_minutes: float,
     departure_time: datetime,
     interval_miles: int = 25,
 ) -> List[Dict[str, Any]]:
     """
-    Sample checkpoints along the route polyline every `interval_miles` (10, 25, or 50 miles),
-    calculating the exact truck ETA and attributable segment mileage for each checkpoint.
+    Sample checkpoints along the route polyline every `interval_miles` (10, 25, or 50 miles).
+    Each checkpoint's ETA assumes constant speed along the route plus HOS breaks taken
+    before reaching it, and carries the road miles it represents (half the gap to each neighbour).
     """
     if not geometry:
         return []
@@ -447,11 +538,6 @@ def sample_route_checkpoints(
     else:
         mileposts[-1] = round(total_distance_miles, 1)
 
-    # Cap total checkpoints at 45 for very long cross-country routes at 10-mi interval to keep API & UI snappy
-    if len(mileposts) > 45:
-        indices = [round(i * (len(mileposts) - 1) / 44) for i in range(45)]
-        mileposts = [mileposts[idx] for idx in sorted(set(indices))]
-
     checkpoints: List[Dict[str, Any]] = []
     num_posts = len(mileposts)
 
@@ -477,7 +563,7 @@ def sample_route_checkpoints(
         progress_fraction = (
             target_mile / total_distance_miles if total_distance_miles > 0 else 0.0
         )
-        elapsed_minutes = progress_fraction * total_duration_minutes
+        elapsed_minutes = hos_elapsed_minutes(progress_fraction * driving_minutes)
         eta_dt = departure_time + timedelta(minutes=elapsed_minutes)
 
         # Compute attributable road miles for this checkpoint (Voronoi midpoint intervals)

@@ -1,17 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import L from 'leaflet';
-import {
-  Clock,
-  CloudRain,
-  CloudSnow,
-  Compass,
-  Fire,
-  Pause,
-  Play,
-  ShieldWarning,
-  Truck,
-  Wind,
-} from '@phosphor-icons/react';
+import { Pause, Play } from '@phosphor-icons/react';
 import type {
   HeatmapCorridor,
   RiskLevel,
@@ -19,12 +8,42 @@ import type {
   RouteOption,
 } from '../types/routing';
 import {
+  drawField,
+  METRIC_BANDS,
+  metricValue,
+  type HeatmapMetric,
+} from '../utils/heatmapField';
+import {
   formatDuration,
   formatEtaTimestamp,
   RISK_COLOR_MAP,
 } from '../utils/riskColors';
+import { ROLE_LABEL, routeChips, routeStroke } from '../utils/routeRoles';
+import { escapeHtml, routeRiskRuns } from '../utils/routeRiskSegments';
 
-export type HeatmapMetric = 'risk' | 'wind' | 'rain' | 'snow';
+const METRIC_LEGEND_TITLE: Record<HeatmapMetric, string> = {
+  risk: 'Risk',
+  wind: 'Wind mph',
+  rain: 'Rain in/h',
+  snow: 'Snow in/h',
+};
+
+/**
+ * Leaflet's canvas renderer can run an animation-frame redraw after map.remove() has destroyed
+ * its context (seen on React remounts), throwing on clearRect/save. Skip redraws once it is gone.
+ */
+const SafeCanvas = L.Canvas.extend({
+  _redraw(this: { _ctx?: CanvasRenderingContext2D; _redrawRequest: number | null }) {
+    if (!this._ctx) {
+      this._redrawRequest = null;
+      return;
+    }
+    (L.Canvas.prototype as unknown as { _redraw: () => void })._redraw.call(this);
+  },
+});
+
+/** Canvas is padded beyond the viewport so short pans don't reveal blank edges before redraw. */
+const HEATMAP_PAD = 0.25;
 
 interface CorridorMapProps {
   routes: RouteOption[];
@@ -34,7 +53,7 @@ interface CorridorMapProps {
   onSelectCheckpoint: (cp: RouteCheckpoint) => void;
   heatmap: HeatmapCorridor;
   forecastHour: number;
-  onChangeForecastHour: (hour: number) => void;
+  onChangeForecastHour: (hour: number | ((prev: number) => number)) => void;
   useSliderTimeForCheckpoints: boolean;
   onToggleSliderTimeMode: (useSlider: boolean) => void;
 }
@@ -70,172 +89,123 @@ export function CorridorMap({
   useEffect(() => {
     if (!isPlaying) return;
     const timer = window.setInterval(() => {
-      onChangeForecastHour((forecastHour + 1) % 49);
+      onChangeForecastHour((prev) => (prev + 1) % 49);
     }, 450);
     return () => window.clearInterval(timer);
-  }, [isPlaying, forecastHour, onChangeForecastHour]);
+  }, [isPlaying, onChangeForecastHour]);
 
   // Initialize Leaflet Map once
   useEffect(() => {
     if (!mapContainerRef.current || mapInstanceRef.current) return;
 
     const map = L.map(mapContainerRef.current, {
-      center: [39.8283, -98.5795],
-      zoom: 5,
-      zoomControl: true,
+      center: [39.5, -98.5],
+      zoom: 4,
+      zoomControl: false,
       preferCanvas: true,
+      renderer: new SafeCanvas() as L.Renderer,
     });
 
+    L.control.zoom({ position: 'topright' }).addTo(map);
+
+    const tileOptions = { maxZoom: 16, attribution: 'Tiles &copy; Esri' };
     L.tileLayer(
-      'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
-      {
-        attribution:
-          '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> &copy; <a href="https://carto.com/attributions">CARTO</a>',
-        subdomains: 'abcd',
-        maxZoom: 18,
-      }
+      'https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}',
+      tileOptions
     ).addTo(map);
+    L.tileLayer(
+      'https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Reference/MapServer/tile/{z}/{y}/{x}',
+      { maxZoom: 16 }
+    ).addTo(map);
+
+    // Heatmap lives in its own pane under the route lines, so it pans with the map for free
+    // and is hidden by Leaflet during zoom animation (leaflet-zoom-hide).
+    const heatPane = map.createPane('heatmap');
+    heatPane.style.zIndex = '350';
+    heatPane.style.pointerEvents = 'none';
+    const canvas = L.DomUtil.create('canvas', 'leaflet-zoom-hide', heatPane);
+    canvasOverlayRef.current = canvas;
 
     routeLayersRef.current = L.layerGroup().addTo(map);
     checkpointLayersRef.current = L.layerGroup().addTo(map);
     truckMarkerRef.current = L.layerGroup().addTo(map);
     mapInstanceRef.current = map;
+    const sizeTimer = window.setTimeout(() => map.invalidateSize(), 200);
 
     return () => {
+      window.clearTimeout(sizeTimer);
       map.remove();
       mapInstanceRef.current = null;
     };
   }, []);
 
-  // Render Canvas Weather Heatmap overlay on pan/zoom/hour/metric change
+  // Weather field: redrawn on hour/metric change and when a pan or zoom settles, never per frame.
   useEffect(() => {
     const map = mapInstanceRef.current;
     const canvas = canvasOverlayRef.current;
     if (!map || !canvas) return;
 
-    const drawHeatmap = () => {
+    const nodes = heatmap?.nodes ?? [];
+    let radiusKm = 60;
+    if (nodes.length) {
+      const lats = nodes.map((n) => n.lat);
+      const lngs = nodes.map((n) => n.lng);
+      const spanKm =
+        Math.hypot(
+          Math.max(...lats) - Math.min(...lats),
+          (Math.max(...lngs) - Math.min(...lngs)) * Math.cos((lats[0] * Math.PI) / 180)
+        ) * 111;
+      radiusKm = Math.min(160, Math.max(40, spanKm / 9));
+    }
+
+    const draw = () => {
       const size = map.getSize();
-      if (canvas.width !== size.x || canvas.height !== size.y) {
-        canvas.width = size.x;
-        canvas.height = size.y;
+      const padX = Math.round(size.x * HEATMAP_PAD);
+      const padY = Math.round(size.y * HEATMAP_PAD);
+      const width = size.x + padX * 2;
+      const height = size.y + padY * 2;
+      if (canvas.width !== width || canvas.height !== height) {
+        canvas.width = width;
+        canvas.height = height;
       }
+      const origin = map.containerPointToLayerPoint([-padX, -padY]);
+      L.DomUtil.setPosition(canvas, origin);
       const ctx = canvas.getContext('2d');
       if (!ctx) return;
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      if (!showHeatmap || !nodes.length) {
+        ctx.clearRect(0, 0, width, height);
+        return;
+      }
 
-      if (!showHeatmap || !heatmap?.nodes?.length) return;
+      const centre = map.getCenter();
+      const a = map.latLngToContainerPoint(centre);
+      const b = map.latLngToContainerPoint([centre.lat + radiusKm / 111, centre.lng]);
+      const radiusPx = Math.max(10, Math.abs(a.y - b.y));
 
-      const zoom = map.getZoom();
-      const baseRadius = Math.max(38, Math.min(115, (zoom - 2) * 20));
-
-      for (const node of heatmap.nodes) {
-        const snap =
-          node.hourly[Math.min(forecastHour, node.hourly.length - 1)] ||
-          node.hourly[0];
+      const points = [];
+      for (const node of nodes) {
+        const snap = node.hourly[Math.min(forecastHour, node.hourly.length - 1)];
         if (!snap) continue;
-
-        let rgb: [number, number, number] = [16, 185, 129];
-        let intensity = 0.16;
-
-        if (heatmapMetric === 'risk') {
-          const riskCfg = RISK_COLOR_MAP[snap.risk] || RISK_COLOR_MAP.Low;
-          rgb = riskCfg.rgb;
-          const weightMap: Record<RiskLevel, number> = {
-            Low: 0.14,
-            Moderate: 0.28,
-            High: 0.42,
-            Severe: 0.56,
-            'No Travel': 0.72,
-          };
-          intensity = weightMap[snap.risk] ?? 0.18;
-        } else if (heatmapMetric === 'wind') {
-          const w = snap.wind_mph;
-          intensity = Math.min(0.7, Math.max(0.12, (w - 10) / 60));
-          rgb =
-            w >= 55
-              ? [236, 72, 153]
-              : w >= 45
-                ? [239, 68, 68]
-                : w >= 35
-                  ? [249, 115, 22]
-                  : w >= 25
-                    ? [234, 179, 8]
-                    : [56, 189, 248];
-        } else if (heatmapMetric === 'rain') {
-          const r = snap.rain_in_hr;
-          if (r < 0.02) continue;
-          intensity = Math.min(0.72, Math.max(0.18, r / 0.9));
-          rgb =
-            r > 1.0
-              ? [236, 72, 153]
-              : r > 0.5
-                ? [239, 68, 68]
-                : r > 0.25
-                  ? [59, 130, 246]
-                  : [56, 189, 248];
-        } else if (heatmapMetric === 'snow') {
-          const s = snap.snow_in_hr;
-          if (s < 0.05) continue;
-          intensity = Math.min(0.75, Math.max(0.22, s / 2.6));
-          rgb =
-            s > 3.0
-              ? [236, 72, 153]
-              : s > 2.0
-                ? [168, 85, 247]
-                : s >= 0.5
-                  ? [99, 102, 241]
-                  : [147, 197, 253];
-        }
-
-        if (!node.is_route_node) {
-          intensity *= 0.65;
-        }
-
         const pt = map.latLngToContainerPoint([node.lat, node.lng]);
-        const radius = node.is_route_node ? baseRadius : baseRadius * 1.35;
-
-        if (
-          pt.x < -radius ||
-          pt.y < -radius ||
-          pt.x > size.x + radius ||
-          pt.y > size.y + radius
-        ) {
+        const x = pt.x + padX;
+        const y = pt.y + padY;
+        if (x < -radiusPx * 3 || y < -radiusPx * 3 || x > width + radiusPx * 3 || y > height + radiusPx * 3) {
           continue;
         }
-
-        const grad = ctx.createRadialGradient(
-          pt.x,
-          pt.y,
-          radius * 0.08,
-          pt.x,
-          pt.y,
-          radius
-        );
-        grad.addColorStop(
-          0,
-          `rgba(${rgb[0]}, ${rgb[1]}, ${rgb[2]}, ${intensity})`
-        );
-        grad.addColorStop(
-          0.55,
-          `rgba(${rgb[0]}, ${rgb[1]}, ${rgb[2]}, ${intensity * 0.45})`
-        );
-        grad.addColorStop(1, `rgba(${rgb[0]}, ${rgb[1]}, ${rgb[2]}, 0)`);
-
-        ctx.fillStyle = grad;
-        ctx.beginPath();
-        ctx.arc(pt.x, pt.y, radius, 0, Math.PI * 2);
-        ctx.fill();
+        points.push({ x, y, value: metricValue(snap, heatmapMetric) });
       }
+      drawField(ctx, width, height, points, METRIC_BANDS[heatmapMetric], radiusPx);
     };
 
-    drawHeatmap();
-    map.on('move zoom resize', drawHeatmap);
+    draw();
+    map.on('moveend zoomend resize', draw);
     return () => {
-      map.off('move zoom resize', drawHeatmap);
+      map.off('moveend zoomend resize', draw);
     };
   }, [heatmap, forecastHour, showHeatmap, heatmapMetric]);
 
-  // Fit bounds when a new set of routes arrives
+  // Fit the camera to the trip once the map has a real size.
+  // The first fit often runs before layout, which leaves a world view.
   useEffect(() => {
     const map = mapInstanceRef.current;
     if (!map || !routes.length) return;
@@ -243,20 +213,28 @@ export function CorridorMap({
     const planKey = routes
       .map((r) => `${r.id}:${r.distance_miles}`)
       .join('|');
-    if (fittedPlanKeyRef.current === planKey) return;
-    fittedPlanKeyRef.current = planKey;
 
-    const allPoints: [number, number][] = [];
-    for (const r of routes) {
-      for (const pt of r.geometry) {
-        allPoints.push(pt);
+    const fit = () => {
+      const allPoints: [number, number][] = [];
+      for (const r of routes) {
+        for (const pt of r.geometry) {
+          allPoints.push(pt);
+        }
       }
+      if (allPoints.length < 2) return;
+      map.invalidateSize();
+      map.fitBounds(L.latLngBounds(allPoints), { padding: [42, 42], maxZoom: 9 });
+    };
+
+    if (fittedPlanKeyRef.current !== planKey) {
+      fittedPlanKeyRef.current = planKey;
+      fit();
     }
-    if (allPoints.length > 1) {
-      const bounds = L.latLngBounds(allPoints);
-      map.fitBounds(bounds, { padding: [42, 42], maxZoom: 9 });
-    }
+    const timer = window.setTimeout(fit, 250);
+    return () => window.clearTimeout(timer);
   }, [routes]);
+
+  const checkpointForecastHour = useSliderTimeForCheckpoints ? forecastHour : 0;
 
   // Render all 3 route polylines & checkpoints
   useEffect(() => {
@@ -275,47 +253,56 @@ export function CorridorMap({
 
     for (const route of orderedRoutes) {
       const isSelected = route.id === selectedRouteId;
-      const isRec = route.is_recommended;
-      const riskCfg =
-        RISK_COLOR_MAP[route.safety.overall_risk_level] || RISK_COLOR_MAP.Low;
+      const baseColor = routeStroke(route, routes);
 
-      const baseColor = isSelected
-        ? isRec
-          ? '#10b981'
-          : riskCfg.hex
-        : '#71717a';
-
-      // Outer subtle casing for selected route
       if (isSelected) {
         L.polyline(route.geometry, {
-          color: '#09090b',
-          weight: 9,
-          opacity: 0.85,
+          color: '#ffffff',
+          weight: 10,
+          opacity: 1,
           lineCap: 'round',
         }).addTo(routeGroup);
       }
 
-      const line = L.polyline(route.geometry, {
-        color: baseColor,
-        weight: isSelected ? 5.5 : 3.5,
-        opacity: isSelected ? 0.96 : 0.55,
-        dashArray: isSelected ? undefined : '6, 8',
-        lineCap: 'round',
-      });
+      const tooltip = `<div style="font-size:12px;font-weight:600;">${escapeHtml(route.name)}</div>
+         <div style="font-size:11px;color:#4d5966;">Safety score ${route.safety.overall_safety_score}/100 | ${route.distance_miles.toFixed(0)} mi | ${formatDuration(route.duration_minutes)}</div>`;
 
-      line.on('click', () => onSelectRoute(route.id));
-      line.bindTooltip(
-        `<div style="font-size:12px;font-weight:600;">${route.name}</div>
-         <div style="font-size:11px;color:#a1a1aa;">Safety Score: ${route.safety.overall_safety_score}/100 | ${route.distance_miles.toFixed(0)} mi | ${formatDuration(route.duration_minutes)}</div>`,
-        { sticky: true }
-      );
-      line.addTo(routeGroup);
+      if (isSelected) {
+        // Selected route is drawn in its checkpoints' risk colours, so risk reads straight off the map.
+        const riskAt = (index: number): RiskLevel => {
+          const cp = route.checkpoints[index];
+          if (!useSliderTimeForCheckpoints) return cp.risk.overall_risk;
+          const snap = cp.hourly_forecast[Math.min(checkpointForecastHour, cp.hourly_forecast.length - 1)];
+          return snap?.risk ?? cp.risk.overall_risk;
+        };
+        for (const run of routeRiskRuns(route, riskAt)) {
+          const segment = L.polyline(run.points, {
+            color: RISK_COLOR_MAP[run.risk].hex,
+            weight: 6,
+            opacity: 1,
+            lineCap: 'round',
+          });
+          segment.bindTooltip(tooltip, { sticky: true });
+          segment.addTo(routeGroup);
+        }
+      } else {
+        const line = L.polyline(route.geometry, {
+          color: baseColor,
+          weight: 3.5,
+          opacity: 0.8,
+          dashArray: '7 8',
+          lineCap: 'round',
+        });
+        line.on('click', () => onSelectRoute(route.id));
+        line.bindTooltip(tooltip, { sticky: true });
+        line.addTo(routeGroup);
+      }
 
       // Draw checkpoints: full detail for selected route, subtle dots for unselected routes
       for (const cp of route.checkpoints) {
         const snap = useSliderTimeForCheckpoints
           ? cp.hourly_forecast[
-              Math.min(forecastHour, cp.hourly_forecast.length - 1)
+              Math.min(checkpointForecastHour, cp.hourly_forecast.length - 1)
             ]
           : null;
 
@@ -334,7 +321,7 @@ export function CorridorMap({
             radius: 3.5,
             fillColor: cpColor.hex,
             fillOpacity: 0.55,
-            color: '#18181b',
+            color: '#ffffff',
             weight: 1,
           });
           miniDot.on('click', () => {
@@ -355,40 +342,42 @@ export function CorridorMap({
           radius: markerRadius,
           fillColor: cpColor.hex,
           fillOpacity: 0.95,
-          color: isOriginOrDest ? '#ffffff' : '#09090b',
+          color: '#ffffff',
           weight: isOriginOrDest ? 2.5 : 2,
         });
 
         const popupHtml = `
           <div style="min-width:225px;font-family:inherit;">
             <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px;">
-              <span style="font-size:11px;font-weight:700;text-transform:uppercase;color:#a1a1aa;">
-                Mile ${cp.mile.toFixed(0)} - ${cp.label}
+              <span style="font-size:12px;font-weight:600;color:#17202b;">
+                Mile ${cp.mile.toFixed(0)}, ${escapeHtml(cp.label)}
               </span>
-              <span style="font-size:11px;font-weight:700;padding:2px 7px;border-radius:999px;background:${cpColor.hex}25;color:${cpColor.hex};border:1px solid ${cpColor.hex}66;">
+              <span style="font-size:11px;font-weight:600;padding:2px 6px;background:${cpColor.hex}22;color:${cpColor.hex};border:1px solid ${cpColor.hex}55;">
                 ${activeRisk}
               </span>
             </div>
-            <div style="font-size:11px;color:#d4d4d8;margin-bottom:8px;">
+            <div style="font-size:12px;color:#4d5966;margin-bottom:8px;">
               ${
                 useSliderTimeForCheckpoints
-                  ? `Forecast Slider: <strong>+${forecastHour}h from departure</strong>`
-                  : `Truck ETA: <strong>${formatEtaTimestamp(cp.eta_iso)}</strong> (+${cp.elapsed_hours.toFixed(1)}h)`
+                  ? `Forecast hour <strong style="color:#17202b;">+${checkpointForecastHour}h</strong>`
+                  : `Arrival <strong style="color:#17202b;">${formatEtaTimestamp(cp.eta_iso)}</strong> (+${cp.elapsed_hours.toFixed(1)}h)`
               }
             </div>
-            <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;background:#09090b;padding:8px;border-radius:8px;border:1px solid #27272a;font-size:11px;">
-              <div><span style="color:#71717a;">Wind:</span> <strong>${activeWind.toFixed(0)} mph</strong></div>
-              <div><span style="color:#71717a;">Temp:</span> <strong>${activeTemp.toFixed(0)} F</strong></div>
-              <div><span style="color:#71717a;">Rain:</span> <strong>${activeRain.toFixed(2)} in/h</strong></div>
-              <div><span style="color:#71717a;">Snow:</span> <strong>${activeSnow.toFixed(2)} in/h</strong></div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;background:#f7f8f9;padding:8px;border:1px solid #e1e4e8;font-size:12px;color:#17202b;">
+              <div><span style="color:#4d5966;">Wind</span> <strong>${activeWind.toFixed(0)} mph</strong>${
+                !snap && cp.weather.gust_mph ? ` <span style="color:#4d5966;">(gust ${cp.weather.gust_mph.toFixed(0)})</span>` : ''
+              }</div>
+              <div><span style="color:#4d5966;">Temp</span> <strong>${activeTemp.toFixed(0)} F</strong></div>
+              <div><span style="color:#4d5966;">Rain</span> <strong>${activeRain.toFixed(2)} in/h</strong></div>
+              <div><span style="color:#4d5966;">Snow</span> <strong>${activeSnow.toFixed(2)} in/h</strong></div>
             </div>
-            <div style="margin-top:7px;font-size:11px;color:#e4e4e7;">
-              <span style="color:#71717a;">Road Surface:</span> ${cp.risk.road_condition.surface_state}
+            <div style="margin-top:7px;font-size:12px;color:#17202b;">
+              <span style="color:#4d5966;">Surface</span> ${cp.risk.road_condition.surface_state}
             </div>
             ${
               cp.risk.load_escalation_note
-                ? `<div style="margin-top:6px;padding:5px 7px;border-radius:6px;background:rgba(239,68,68,0.15);border:1px solid rgba(239,68,68,0.35);color:#fca5a5;font-size:10.5px;">
-                     ${cp.risk.load_escalation_note}
+                ? `<div style="margin-top:6px;padding:6px 8px;background:#fde8e6;border:1px solid #f0b8b2;color:#6f1d18;font-size:12px;">
+                     ${escapeHtml(cp.risk.load_escalation_note)}
                    </div>`
                 : ''
             }
@@ -403,7 +392,7 @@ export function CorridorMap({
   }, [
     routes,
     selectedRouteId,
-    forecastHour,
+    checkpointForecastHour,
     useSliderTimeForCheckpoints,
     onSelectRoute,
     onSelectCheckpoint,
@@ -432,11 +421,9 @@ export function CorridorMap({
 
     const truckIcon = L.divIcon({
       className: 'custom-truck-marker',
-      html: `<div style="display:flex;align-items:center;justify-content:center;width:28px;height:28px;border-radius:999px;background:#10b981;color:#09090b;border:2px solid #ffffff;box-shadow:0 0 14px rgba(16,185,129,0.75);font-weight:800;font-size:11px;">
-        T
-      </div>`,
-      iconSize: [28, 28],
-      iconAnchor: [14, 14],
+      html: `<div style="width:14px;height:14px;background:#17202b;border:2px solid #ffffff;box-shadow:0 0 0 1px #17202b;"></div>`,
+      iconSize: [14, 14],
+      iconAnchor: [7, 7],
     });
 
     const marker = L.marker([chosenCp.lat, chosenCp.lng], {
@@ -454,17 +441,17 @@ export function CorridorMap({
   useEffect(() => {
     const map = mapInstanceRef.current;
     if (!map || !focusedCheckpoint) return;
+    const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
     map.flyTo([focusedCheckpoint.lat, focusedCheckpoint.lng], 7, {
-      duration: 0.65,
+      duration: reduceMotion ? 0 : 0.6,
     });
   }, [focusedCheckpoint]);
 
   // Compute slider timestamp display
   const sliderTimestampLabel = (() => {
-    if (!heatmap?.departure_iso) return `+${forecastHour}h`;
-    const dt = new Date(
-      new Date(heatmap.departure_iso).getTime() + forecastHour * 3600 * 1000
-    );
+    const startIso = heatmap?.forecast_start_iso ?? heatmap?.departure_iso;
+    if (!startIso) return `+${forecastHour}h`;
+    const dt = new Date(new Date(startIso).getTime() + forecastHour * 3600 * 1000);
     return dt.toLocaleString('en-US', {
       weekday: 'short',
       month: 'short',
@@ -475,222 +462,196 @@ export function CorridorMap({
   })();
 
   return (
-    <div className="flex flex-col rounded-2xl border border-zinc-800/90 bg-zinc-900/75 overflow-hidden shadow-xl">
-      {/* Top Map Toolbar */}
-      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-zinc-800/80 px-4 py-3 bg-zinc-900/90">
-        <div className="flex items-center gap-2.5">
-          <Compass size={18} className="text-emerald-400" weight="duotone" />
-          <span className="text-sm font-semibold text-zinc-100">
-            Trip Corridor Map &amp; 48h Weather Heatmap
-          </span>
-          <span className="hidden sm:inline-flex items-center gap-1 rounded-full bg-zinc-800 px-2.5 py-0.5 text-xs font-mono text-zinc-300 border border-zinc-700/70">
-            {selectedRoute?.checkpoints.length || 0} checkpoints sampled
-          </span>
+    <div className="flex flex-col bg-white">
+      <div id="corridor-map" className="flex flex-wrap items-center justify-between gap-3 border-b border-line px-4 py-2.5">
+        <div className="min-w-0">
+          <p className="text-sm font-semibold">Corridor map</p>
+          <p className="text-xs text-muted">
+            {selectedRoute?.checkpoints.length || 0} checkpoints. Forecast{' '}
+            <span className="font-mono text-ink">+{forecastHour}h</span>
+            <span className="hidden sm:inline">, {sliderTimestampLabel}</span>
+          </p>
         </div>
-
-        {/* Heatmap Layer Controls */}
         <div className="flex flex-wrap items-center gap-2">
           <button
             type="button"
+            aria-pressed={showHeatmap}
             onClick={() => setShowHeatmap((prev) => !prev)}
-            className={`inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-medium transition cursor-pointer border ${
+            className={`min-h-10 cursor-pointer border px-2.5 text-xs font-medium focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ink ${
               showHeatmap
-                ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40'
-                : 'bg-zinc-800/80 text-zinc-400 border-zinc-700 hover:text-zinc-200'
+                ? 'border-ink bg-ink text-white'
+                : 'border-line bg-white text-ink hover:bg-canvas'
             }`}
           >
-            <Fire size={14} weight="fill" />
-            {showHeatmap ? 'Heatmap On' : 'Heatmap Off'}
+            {showHeatmap ? 'Heatmap on' : 'Heatmap off'}
           </button>
-
-          {showHeatmap && (
-            <div className="inline-flex rounded-lg bg-zinc-950 p-0.5 border border-zinc-800">
+          {showHeatmap ? (
+            <div role="group" aria-label="Heatmap metric" className="flex border border-line">
               {(
                 [
-                  { id: 'risk', label: 'Risk', icon: ShieldWarning },
-                  { id: 'wind', label: 'Wind', icon: Wind },
-                  { id: 'rain', label: 'Rain', icon: CloudRain },
-                  { id: 'snow', label: 'Snow', icon: CloudSnow },
+                  { id: 'risk', label: 'Risk' },
+                  { id: 'wind', label: 'Wind' },
+                  { id: 'rain', label: 'Rain' },
+                  { id: 'snow', label: 'Snow' },
                 ] as const
               ).map((item) => {
-                const Icon = item.icon;
                 const active = heatmapMetric === item.id;
                 return (
                   <button
                     key={item.id}
                     type="button"
+                    aria-pressed={active}
                     onClick={() => setHeatmapMetric(item.id)}
-                    className={`inline-flex items-center gap-1 rounded-md px-2.5 py-1 text-xs font-medium transition cursor-pointer ${
-                      active
-                        ? 'bg-zinc-800 text-zinc-100 shadow-xs'
-                        : 'text-zinc-400 hover:text-zinc-200'
+                    className={`min-h-10 cursor-pointer px-2.5 text-xs font-medium focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-ink ${
+                      active ? 'bg-canvas text-ink' : 'text-muted hover:text-ink'
                     }`}
                   >
-                    <Icon size={13} />
                     {item.label}
                   </button>
                 );
               })}
             </div>
-          )}
+          ) : null}
         </div>
       </div>
 
-      {/* Map Viewport + Canvas Heatmap Overlay */}
-      <div className="relative h-[430px] sm:h-[490px] w-full">
-        <div ref={mapContainerRef} className="h-full w-full z-0" />
-        <canvas
-          ref={canvasOverlayRef}
-          className="pointer-events-none absolute inset-0 z-[400]"
-        />
-
-        {/* Floating Route Selector Pills on Map */}
-        <div className="absolute top-3 left-14 right-3 z-[500] flex flex-wrap gap-2 pointer-events-none">
-          {routes.map((route) => {
-            const isSelected = route.id === selectedRouteId;
-            const riskStyle =
-              RISK_COLOR_MAP[route.safety.overall_risk_level] ||
-              RISK_COLOR_MAP.Low;
-            return (
-              <button
-                key={route.id}
-                type="button"
-                onClick={() => onSelectRoute(route.id)}
-                className={`pointer-events-auto flex items-center gap-2 rounded-xl px-3 py-1.5 text-xs font-medium transition backdrop-blur-md cursor-pointer border ${
-                  isSelected
-                    ? 'bg-zinc-900/95 text-zinc-100 border-emerald-500/60 shadow-lg'
-                    : 'bg-zinc-950/80 text-zinc-300 border-zinc-800 hover:border-zinc-700'
-                }`}
-              >
-                <span
-                  className={`h-2.5 w-2.5 rounded-full ${riskStyle.dotClass}`}
-                />
-                <span className="font-semibold">{route.name}</span>
-                <span className="font-mono text-zinc-300">
-                  {route.safety.overall_safety_score}/100
-                </span>
-                {route.is_recommended && (
-                  <span className="rounded-md bg-emerald-500/20 px-1.5 py-0.5 text-[10px] font-bold uppercase text-emerald-300 border border-emerald-500/30">
-                    Best
-                  </span>
-                )}
-              </button>
-            );
-          })}
-        </div>
-
-        {/* Floating Risk Legend */}
-        <div className="absolute bottom-3 left-3 z-[500] flex flex-wrap items-center gap-2.5 rounded-xl bg-zinc-950/90 backdrop-blur-md border border-zinc-800/90 px-3 py-2 text-[11px]">
-          <span className="font-semibold text-zinc-400 uppercase tracking-wider">
-            Risk Scale:
-          </span>
-          {(
-            ['Low', 'Moderate', 'High', 'Severe', 'No Travel'] as RiskLevel[]
-          ).map((lvl) => (
-            <span key={lvl} className="inline-flex items-center gap-1.5 text-zinc-200">
+      <div className="flex flex-wrap gap-2 border-b border-line px-4 py-2">
+        {routes.map((route) => {
+          const isSelected = route.id === selectedRouteId;
+          const chips = routeChips(route, routes);
+          return (
+            <button
+              key={route.id}
+              type="button"
+              aria-pressed={isSelected}
+              onClick={() => onSelectRoute(route.id)}
+              className={`inline-flex min-h-10 max-w-full cursor-pointer items-center gap-2 border px-2.5 text-left text-xs focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ink ${
+                isSelected ? 'border-ink bg-faint' : 'border-line bg-white hover:bg-canvas'
+              }`}
+            >
               <span
-                className={`h-2.5 w-2.5 rounded-full ${RISK_COLOR_MAP[lvl].dotClass}`}
+                className="h-2.5 w-2.5 shrink-0"
+                style={{ backgroundColor: routeStroke(route, routes) }}
+                aria-hidden
               />
-              {lvl}
+              <span className="truncate font-medium">{route.name}</span>
+              <span className="font-mono">{route.safety.overall_safety_score}</span>
+              {chips[0] ? <span className="text-muted">{ROLE_LABEL[chips[0]]}</span> : null}
+            </button>
+          );
+        })}
+      </div>
+
+      <div className="relative h-[min(58vh,600px)] min-h-[340px] w-full">
+        <div ref={mapContainerRef} className="z-0 h-full w-full" />
+
+        <div className="absolute bottom-3 left-3 z-[500] flex max-w-[calc(100%-5rem)] flex-col gap-1 border border-line bg-white px-2.5 py-1.5 text-xs">
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+            <span className="text-muted">
+              {showHeatmap && heatmapMetric !== 'risk' ? 'Route risk' : 'Risk'}
             </span>
-          ))}
+            {(['Low', 'Moderate', 'High', 'Severe', 'No Travel'] as RiskLevel[]).map((level) => (
+              <span key={level} className="inline-flex items-center gap-1.5">
+                <span className={`h-2 w-2 ${RISK_COLOR_MAP[level].dotClass}`} aria-hidden />
+                {level}
+              </span>
+            ))}
+          </div>
+          {showHeatmap && heatmapMetric !== 'risk' ? (
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+              <span className="text-muted">{METRIC_LEGEND_TITLE[heatmapMetric]}</span>
+              {METRIC_BANDS[heatmapMetric]
+                .filter((band) => band.label)
+                .map((band) => (
+                  <span key={band.label} className="inline-flex items-center gap-1.5 font-mono">
+                    <span
+                      className="h-2 w-3"
+                      style={{ backgroundColor: `rgb(${band.rgb.join(',')})`, opacity: band.alpha ? 0.85 : 0.25 }}
+                      aria-hidden
+                    />
+                    {band.label}
+                  </span>
+                ))}
+            </div>
+          ) : null}
         </div>
       </div>
 
-      {/* 0-48 Hour Forecast Slider Bar */}
-      <div className="border-t border-zinc-800/90 bg-zinc-950/90 px-4 py-3.5">
-        <div className="flex flex-wrap items-center justify-between gap-3 mb-2.5">
-          <div className="flex items-center gap-2.5">
+      <div className="border-t border-line px-4 py-3">
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+          <div className="flex flex-wrap items-center gap-2">
             <button
               type="button"
-              onClick={() => setIsPlaying((p) => !p)}
-              className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-zinc-950 font-semibold px-3 py-1.5 text-xs transition cursor-pointer"
+              onClick={() => setIsPlaying((playing) => !playing)}
+              className="inline-flex min-h-10 cursor-pointer items-center gap-1.5 border border-line bg-white px-2.5 text-xs font-medium hover:bg-canvas focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ink"
             >
-              {isPlaying ? (
-                <>
-                  <Pause size={14} weight="fill" />
-                  Pause 48h Forecast
-                </>
-              ) : (
-                <>
-                  <Play size={14} weight="fill" />
-                  Animate 0-48h Weather
-                </>
-              )}
+              {isPlaying ? <Pause size={14} weight="fill" /> : <Play size={14} weight="fill" />}
+              {isPlaying ? 'Pause' : 'Play forecast'}
             </button>
-            <div className="flex items-center gap-2 text-xs text-zinc-300">
-              <Clock size={15} className="text-emerald-400" />
-              <span className="font-mono font-semibold text-zinc-100">
-                +{forecastHour}h Forecast Window
-              </span>
-              <span className="text-zinc-400">({sliderTimestampLabel})</span>
-            </div>
+            <p className="font-mono text-xs">
+              +{forecastHour}h
+              <span className="ml-2 font-sans text-muted">{sliderTimestampLabel}</span>
+            </p>
           </div>
-
-          <div className="flex items-center gap-2">
-            <span className="text-xs text-zinc-400">Checkpoint Dots:</span>
-            <div className="inline-flex rounded-lg bg-zinc-900 p-0.5 border border-zinc-800 text-xs">
-              <button
-                type="button"
-                onClick={() => onToggleSliderTimeMode(false)}
-                className={`rounded-md px-2.5 py-1 font-medium transition cursor-pointer ${
-                  !useSliderTimeForCheckpoints
-                    ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
-                    : 'text-zinc-400 hover:text-zinc-200'
-                }`}
-              >
-                At Truck ETA
-              </button>
-              <button
-                type="button"
-                onClick={() => onToggleSliderTimeMode(true)}
-                className={`rounded-md px-2.5 py-1 font-medium transition cursor-pointer ${
-                  useSliderTimeForCheckpoints
-                    ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
-                    : 'text-zinc-400 hover:text-zinc-200'
-                }`}
-              >
-                At Slider Hour (+{forecastHour}h)
-              </button>
-            </div>
+          <div
+            role="group"
+            aria-label="Checkpoint time"
+            className="flex border border-line text-xs"
+          >
+            <button
+              type="button"
+              aria-pressed={!useSliderTimeForCheckpoints}
+              onClick={() => onToggleSliderTimeMode(false)}
+              className={`min-h-10 cursor-pointer px-2.5 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-ink ${
+                !useSliderTimeForCheckpoints ? 'bg-ink text-white' : 'bg-white hover:bg-canvas'
+              }`}
+            >
+              At arrival
+            </button>
+            <button
+              type="button"
+              aria-pressed={useSliderTimeForCheckpoints}
+              onClick={() => onToggleSliderTimeMode(true)}
+              className={`min-h-10 cursor-pointer border-l border-line px-2.5 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-ink ${
+                useSliderTimeForCheckpoints ? 'bg-ink text-white' : 'bg-white hover:bg-canvas'
+              }`}
+            >
+              At +{forecastHour}h
+            </button>
           </div>
         </div>
-
         <div className="flex items-center gap-3">
-          <span className="text-xs font-mono text-zinc-400 w-10">0h</span>
+          <span className="w-8 font-mono text-xs text-muted">0h</span>
           <input
             type="range"
             min={0}
             max={48}
             step={1}
             value={forecastHour}
-            onChange={(e) => {
+            onChange={(event) => {
               setIsPlaying(false);
-              onChangeForecastHour(Number(e.target.value));
+              onChangeForecastHour(Number(event.target.value));
             }}
-            aria-label="0 to 48 hour weather forecast slider"
-            className="w-full accent-emerald-500 cursor-pointer h-2 bg-zinc-800 rounded-lg"
+            aria-label="Forecast hour, 0 to 48"
+            className="h-2 w-full cursor-pointer accent-ink"
           />
-          <span className="text-xs font-mono text-zinc-400 w-10 text-right">
-            +48h
-          </span>
+          <span className="w-10 text-right font-mono text-xs text-muted">48h</span>
         </div>
-
-        <div className="mt-2 flex flex-wrap items-center justify-between text-[11px] text-zinc-400">
-          <span className="inline-flex items-center gap-1.5">
-            <Truck size={13} className="text-emerald-400" />
-            Selected Route Duration:{' '}
-            <strong className="text-zinc-200 font-mono">
-              {selectedRoute
-                ? `${(selectedRoute.duration_minutes / 60).toFixed(1)} hrs`
-                : '0 hrs'}
-            </strong>
+        <p className="mt-2 text-xs leading-5 text-muted">
+          The heatmap shows conditions at{' '}
+          <span className="font-mono text-ink">+{forecastHour}h</span>.{' '}
+          {useSliderTimeForCheckpoints
+            ? 'The route and checkpoints show the same hour.'
+            : 'The route and checkpoints show conditions when the truck reaches each one.'}{' '}
+          Trip time{' '}
+          <span className="font-mono text-ink">
+            {selectedRoute ? formatDuration(selectedRoute.duration_minutes) : '-'}
           </span>
-          <span>
-            Drag the 0-48h slider to inspect moving wind, rain, and snow cells
-            along the trip corridor.
-          </span>
-        </div>
+          {selectedRoute?.hos_stops?.length
+            ? `, including ${selectedRoute.hos_stops.length} HOS stop${selectedRoute.hos_stops.length > 1 ? 's' : ''}`
+            : ''}
+          .
+        </p>
       </div>
     </div>
   );

@@ -12,44 +12,44 @@ export const RISK_COLOR_MAP: Record<
   }
 > = {
   Low: {
-    hex: '#10b981',
-    rgb: [16, 185, 129],
-    badgeBg: 'bg-emerald-500/15',
-    badgeText: 'text-emerald-300',
-    badgeBorder: 'border-emerald-500/35',
-    dotClass: 'bg-emerald-400',
+    hex: '#146C43',
+    rgb: [20, 108, 67],
+    badgeBg: 'bg-[#E6F3EC]',
+    badgeText: 'text-[#0E5132]',
+    badgeBorder: 'border-[#B7DCC6]',
+    dotClass: 'bg-[#146C43]',
   },
   Moderate: {
-    hex: '#eab308',
-    rgb: [234, 179, 8],
-    badgeBg: 'bg-yellow-500/15',
-    badgeText: 'text-yellow-300',
-    badgeBorder: 'border-yellow-500/35',
-    dotClass: 'bg-yellow-400',
+    hex: '#A16207',
+    rgb: [161, 98, 7],
+    badgeBg: 'bg-[#FBF3D8]',
+    badgeText: 'text-[#7A4D05]',
+    badgeBorder: 'border-[#E6D394]',
+    dotClass: 'bg-[#A16207]',
   },
   High: {
-    hex: '#f97316',
-    rgb: [249, 115, 22],
-    badgeBg: 'bg-orange-500/15',
-    badgeText: 'text-orange-300',
-    badgeBorder: 'border-orange-500/35',
-    dotClass: 'bg-orange-400',
+    hex: '#C2410C',
+    rgb: [194, 65, 12],
+    badgeBg: 'bg-[#FDE8D8]',
+    badgeText: 'text-[#9A3412]',
+    badgeBorder: 'border-[#F0C4A6]',
+    dotClass: 'bg-[#C2410C]',
   },
   Severe: {
-    hex: '#ef4444',
-    rgb: [239, 68, 68],
-    badgeBg: 'bg-red-500/15',
-    badgeText: 'text-red-300',
-    badgeBorder: 'border-red-500/40',
-    dotClass: 'bg-red-500',
+    hex: '#B42318',
+    rgb: [180, 35, 24],
+    badgeBg: 'bg-[#FDE8E6]',
+    badgeText: 'text-[#8E1B14]',
+    badgeBorder: 'border-[#F0B8B2]',
+    dotClass: 'bg-[#B42318]',
   },
   'No Travel': {
-    hex: '#ec4899',
-    rgb: [236, 72, 153],
-    badgeBg: 'bg-pink-500/20',
-    badgeText: 'text-pink-200',
-    badgeBorder: 'border-pink-500/50',
-    dotClass: 'bg-pink-500',
+    hex: '#9F1239',
+    rgb: [159, 18, 57],
+    badgeBg: 'bg-[#FBE7EE]',
+    badgeText: 'text-[#9F1239]',
+    badgeBorder: 'border-[#E7B3C4]',
+    dotClass: 'bg-[#9F1239]',
   },
 };
 
@@ -61,41 +61,41 @@ export function getScoreColorClasses(score: number): {
 } {
   if (score >= 82) {
     return {
-      text: 'text-emerald-400',
-      ring: 'border-emerald-500/40',
-      bg: 'bg-emerald-500/10',
-      label: 'Optimal Dispatch',
+      text: 'text-[#0E5132]',
+      ring: 'border-[#B7DCC6]',
+      bg: 'bg-[#E6F3EC]',
+      label: 'Favorable',
     };
   }
   if (score >= 65) {
     return {
-      text: 'text-yellow-300',
-      ring: 'border-yellow-500/40',
-      bg: 'bg-yellow-500/10',
-      label: 'Moderate Caution',
+      text: 'text-[#7A4D05]',
+      ring: 'border-[#E6D394]',
+      bg: 'bg-[#FBF3D8]',
+      label: 'Caution',
     };
   }
   if (score >= 45) {
     return {
-      text: 'text-orange-400',
-      ring: 'border-orange-500/40',
-      bg: 'bg-orange-500/10',
-      label: 'High Risk Advisory',
+      text: 'text-[#9A3412]',
+      ring: 'border-[#F0C4A6]',
+      bg: 'bg-[#FDE8D8]',
+      label: 'Elevated',
     };
   }
   if (score >= 25) {
     return {
-      text: 'text-red-400',
-      ring: 'border-red-500/40',
-      bg: 'bg-red-500/10',
-      label: 'Severe Hazard',
+      text: 'text-[#8E1B14]',
+      ring: 'border-[#F0B8B2]',
+      bg: 'bg-[#FDE8E6]',
+      label: 'Severe',
     };
   }
   return {
-    text: 'text-pink-400',
-    ring: 'border-pink-500/50',
-    bg: 'bg-pink-500/15',
-    label: 'No Travel / Hold Load',
+    text: 'text-[#9F1239]',
+    ring: 'border-[#E7B3C4]',
+    bg: 'bg-[#FBE7EE]',
+    label: 'Hold',
   };
 }
 

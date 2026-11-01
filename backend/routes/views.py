@@ -16,19 +16,20 @@ from .services.risk_engine import (
 )
 from .services.routing_service import (
     FREIGHT_HUBS,
+    apply_hos_to_route,
     fetch_three_routes,
     geocode_location,
     haversine_miles,
     sample_route_checkpoints,
 )
-from .services.weather_service import populate_routes_weather_and_heatmap
+from .services.weather_service import WeatherUnavailable, populate_routes_weather_and_heatmap
 
 
 PRESET_SCENARIOS = [
     {
         "id": "high_plains_wind",
         "title": "High Plains Crosswind Alert",
-        "subtitle": "I-80 vs I-70 Corridor - Heavy 42,000 lb Dry Van",
+        "subtitle": "Storm scenario - 42,000 lb dry van",
         "origin": "Omaha, NE",
         "destination": "Denver, CO",
         "load_weight_lbs": 42000,
@@ -40,7 +41,7 @@ PRESET_SCENARIOS = [
     {
         "id": "rockies_snow",
         "title": "Rocky Mountain Winter Squall",
-        "subtitle": "Denver, CO to Salt Lake City, UT - 36,000 lb Reefer",
+        "subtitle": "Storm scenario - 36,000 lb reefer",
         "origin": "Denver, CO",
         "destination": "Salt Lake City, UT",
         "load_weight_lbs": 36000,
@@ -51,8 +52,8 @@ PRESET_SCENARIOS = [
     },
     {
         "id": "midwest_live",
-        "title": "Live Weather Dispatch (Open-Meteo + OSRM)",
-        "subtitle": "Chicago, IL to Kansas City, MO - 38,000 lb Load",
+        "title": "Live Weather Dispatch",
+        "subtitle": "Live forecast - 38,000 lb dry van",
         "origin": "Chicago, IL",
         "destination": "Kansas City, MO",
         "load_weight_lbs": 38000,
@@ -64,7 +65,7 @@ PRESET_SCENARIOS = [
     {
         "id": "southern_rain",
         "title": "Gulf Corridor Heavy Rain & Gusts",
-        "subtitle": "Dallas, TX to Atlanta, GA - 44,500 lb Flatbed",
+        "subtitle": "Storm scenario - 44,500 lb flatbed, 50 mi checkpoints",
         "origin": "Dallas, TX",
         "destination": "Atlanta, GA",
         "load_weight_lbs": 44500,
@@ -165,7 +166,7 @@ class PlanRouteAPIView(APIView):
         load_weight_lbs = validated["load_weight_lbs"]
         sampling_interval_miles = int(validated["sampling_interval_miles"])
         truck_type = validated.get("truck_type", "dry_van")
-        weather_mode = validated.get("weather_mode", "auto")
+        weather_mode = validated.get("weather_mode", "live")
 
         # 1. Geocode origin & destination
         try:
@@ -200,27 +201,35 @@ class PlanRouteAPIView(APIView):
         # 2. Fetch 3 route options
         raw_routes, routing_source = fetch_three_routes(origin_geo, destination_geo)
 
-        # 3. Sample checkpoints along each route every 10 / 25 / 50 miles
+        # 3. Sample checkpoints every 10 / 25 / 50 miles with HOS-aware ETAs
         for route in raw_routes:
+            apply_hos_to_route(route)
             route["checkpoints"] = sample_route_checkpoints(
                 geometry=route["geometry"],
                 total_distance_miles=route["distance_miles"],
-                total_duration_minutes=route["duration_minutes"],
+                driving_minutes=route["driving_minutes"],
                 departure_time=departure_time,
                 interval_miles=sampling_interval_miles,
             )
 
-        # 4. Populate ETA weather + 0-48h forecast + corridor heatmap
-        routes_with_weather, heatmap_corridor, weather_source = (
-            populate_routes_weather_and_heatmap(
-                routes=raw_routes,
-                origin=origin_geo,
-                destination=destination_geo,
-                departure_time=departure_time,
-                load_weight_lbs=load_weight_lbs,
-                weather_mode=weather_mode,
+        # 4. Weather at each checkpoint's ETA + 0-48h corridor heatmap
+        try:
+            routes_with_weather, heatmap_corridor, weather_source = (
+                populate_routes_weather_and_heatmap(
+                    routes=raw_routes,
+                    departure_time=departure_time,
+                    load_weight_lbs=load_weight_lbs,
+                    weather_mode=weather_mode,
+                )
             )
-        )
+        except WeatherUnavailable as exc:
+            return Response(
+                {
+                    "error": f"Live weather forecast is unavailable right now ({exc}) Try again, or run the storm scenario.",
+                    "details": {},
+                },
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
 
         # 5. Score, rank, and generate plain-language "Why this route?" explanations
         ranked_routes = rank_and_explain_routes(
@@ -247,12 +256,16 @@ class PlanRouteAPIView(APIView):
                 "is_simulated_weather": weather_source != "live_open_meteo",
                 "is_simulated_routing": routing_source == "simulated_fallback",
                 "transparency_note": (
-                    "Routes generated via live OSRM road network; weather from live Open-Meteo 48h forecast API."
-                    if routing_source != "simulated_fallback"
-                    and weather_source == "live_open_meteo"
-                    else "Routes from OSRM road network; weather uses deterministic Storm Corridor Simulation to demonstrate severe wind/snow/rain load thresholds."
-                    if routing_source != "simulated_fallback"
-                    else "Using deterministic highway corridor & synoptic storm simulation."
+                    (
+                        "Routes from the OSRM road network. "
+                        if routing_source == "live_osrm"
+                        else "Some routes are estimated corridors because the routing API returned fewer than 3 options. "
+                    )
+                    + (
+                        "Weather is the Open-Meteo hourly forecast at each checkpoint's ETA."
+                        if weather_source == "live_open_meteo"
+                        else "Weather is a simulated storm scenario placed on the corridor to demonstrate the wind, rain, snow and load rules."
+                    )
                 ),
             },
             "recommended_route_id": recommended_route["id"],

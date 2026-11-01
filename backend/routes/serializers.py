@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import timedelta
 from django.utils import timezone
 from rest_framework import serializers
 from .models import RoutePlanQuery
@@ -47,9 +47,22 @@ class RoutePlanRequestSerializer(serializers.Serializer):
         default="dry_van",
     )
     weather_mode = serializers.ChoiceField(
-        choices=["auto", "live", "simulated"],
-        default="auto",
+        choices=["live", "simulated", "auto"],  # "auto" kept for older clients; treated as live
+        default="live",
     )
+
+    MAX_DEPARTURE_LEAD = timedelta(days=7)
+    DEPARTURE_GRACE = timedelta(hours=1)
+
+    def validate_departure_time(self, value):
+        now = timezone.now()
+        if value < now - self.DEPARTURE_GRACE:
+            raise serializers.ValidationError("Departure time cannot be in the past.")
+        if value > now + self.MAX_DEPARTURE_LEAD:
+            raise serializers.ValidationError(
+                "Departure must be within the next 7 days so the forecast covers the trip."
+            )
+        return value
 
     def validate(self, attrs):
         origin_clean = attrs["origin"].strip().lower()

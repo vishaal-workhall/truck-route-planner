@@ -34,6 +34,8 @@ export interface CheckpointRisk {
 
 export interface CheckpointWeather {
   wind_mph: number;
+  gust_mph?: number;
+  forecast_hour?: number;
   rain_in_hr: number;
   snow_in_hr: number;
   temperature_f: number;
@@ -135,17 +137,25 @@ export interface RouteOption {
   duration_minutes: number;
   geometry: [number, number][];
   source: string;
+  driving_minutes?: number;
+  hos_stops?: HosStop[];
   rank: number;
   is_recommended: boolean;
   checkpoints: RouteCheckpoint[];
   safety: RouteSafetySummary;
 }
 
+export interface HosStop {
+  kind: '30-min break' | '10-hr rest';
+  mile: number;
+  at_driving_minutes: number;
+  start_elapsed_minutes: number;
+  duration_minutes: number;
+}
+
 export interface HeatmapNode {
-  id: string;
   lat: number;
   lng: number;
-  route_id: string | null;
   is_route_node: boolean;
   hourly: HourlyForecastSnap[];
 }
@@ -153,7 +163,10 @@ export interface HeatmapNode {
 export interface HeatmapCorridor {
   min_hour: number;
   max_hour: number;
-  departure_iso: string;
+  /** Series start: departure rounded to the hour. Slider hour h = this + h hours. */
+  forecast_start_iso?: string;
+  /** Older saved plans only. */
+  departure_iso?: string;
   weather_source: string;
   nodes: HeatmapNode[];
 }

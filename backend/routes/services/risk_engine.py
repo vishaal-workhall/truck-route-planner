@@ -1,3 +1,4 @@
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 # Canonical Risk Levels ordered by severity
@@ -44,6 +45,15 @@ TRUCK_PROFILE_FACTORS: Dict[str, Dict[str, Any]] = {
         "description": "Articulated rear pup trailer is highly vulnerable to wind gusts and icy lane changes.",
     },
 }
+
+
+def format_minutes(minutes: float) -> str:
+    """Human duration: 45 min, 3 h, 12 h 41 min."""
+    total = int(round(abs(minutes)))
+    hours, mins = divmod(total, 60)
+    if hours == 0:
+        return f"{mins} min"
+    return f"{hours} h" if mins == 0 else f"{hours} h {mins} min"
 
 
 def classify_wind_risk(wind_mph: float) -> str:
@@ -531,6 +541,8 @@ def rank_and_explain_routes(
     for idx, route in enumerate(sorted_routes):
         route["rank"] = idx + 1
         route["is_recommended"] = idx == 0
+        # Letter routes by rank so "Route A" is always the recommendation.
+        route["name"] = re.sub(r"^Route [A-Z]", f"Route {chr(65 + idx)}", route["name"])
         if idx > 0:
             prev_score = sorted_routes[idx - 1]["safety"]["overall_safety_score"]
             if route["safety"]["overall_safety_score"] >= prev_score:
@@ -636,7 +648,7 @@ def rank_and_explain_routes(
                 key_reasons.append(
                     {
                         "type": "info",
-                        "text": f"Adds {time_diff_vs_fastest} min over the fastest route ({fastest['name']}) to bypass hazardous weather.",
+                        "text": f"Adds {format_minutes(time_diff_vs_fastest)} over the fastest route ({fastest['name']}) to bypass hazardous weather.",
                     }
                 )
 
@@ -656,7 +668,7 @@ def rank_and_explain_routes(
             time_tradeoff_clause = (
                 " It is also the fastest corridor available, requiring no schedule trade-off."
                 if time_diff_vs_fastest <= 5
-                else f" While it takes {time_diff_vs_fastest} minutes longer than {fastest['name']}, the extra travel time keeps your {load_weight_lbs:,} lb {load_info['truck_type_label']} out of high-risk weather cells."
+                else f" While it takes {format_minutes(time_diff_vs_fastest)} longer than {fastest['name']}, the extra travel time keeps your {load_weight_lbs:,} lb {load_info['truck_type_label']} out of high-risk weather cells."
             )
 
             why_this_route = (
@@ -698,14 +710,14 @@ def rank_and_explain_routes(
                 key_reasons.append(
                     {
                         "type": "info",
-                        "text": f"Saves {abs(time_diff_vs_rec)} min vs recommended route, but loses {abs(score_diff_vs_rec)} Safety Score points.",
+                        "text": f"Saves {format_minutes(time_diff_vs_rec)} vs recommended route, but loses {abs(score_diff_vs_rec)} Safety Score points.",
                     }
                 )
             else:
                 key_reasons.append(
                     {
                         "type": "warning",
-                        "text": f"Takes {time_diff_vs_rec} min longer than {recommended['name']} with {abs(score_diff_vs_rec)} lower Safety Score.",
+                        "text": f"Takes {format_minutes(time_diff_vs_rec)} longer than {recommended['name']} with {abs(score_diff_vs_rec)} lower Safety Score.",
                     }
                 )
 
@@ -715,9 +727,9 @@ def rank_and_explain_routes(
                 f"{rm['no_travel_miles']:.0f} No-Travel miles, {rm['severe_miles']:.0f} Severe miles, and {rm['high_miles']:.0f} High-risk miles "
                 f"(average risk {route['safety']['average_risk_score']}/5.0 vs {recommended['safety']['average_risk_score']}/5.0). "
                 + (
-                    f"Even though it is {abs(time_diff_vs_rec)} minutes faster, the weather and load risks outweigh the time savings."
+                    f"Even though it is {format_minutes(time_diff_vs_rec)} faster, the weather and load risks outweigh the time savings."
                     if time_diff_vs_rec < 0
-                    else f"It is both slower (+{time_diff_vs_rec} min) and more exposed to weather hazards than {recommended['name']}."
+                    else f"It is both slower (+{format_minutes(time_diff_vs_rec)}) and more exposed to weather hazards than {recommended['name']}."
                 )
             )
 
@@ -732,11 +744,11 @@ def rank_and_explain_routes(
             "tradeoff_headline": (
                 "Recommended: Optimal balance of safety and travel time"
                 if route["is_recommended"] and time_diff_vs_fastest <= 5
-                else f"Recommended: +{time_diff_vs_fastest} min vs fastest to avoid severe weather"
+                else f"Recommended: +{format_minutes(time_diff_vs_fastest)} vs fastest to avoid severe weather"
                 if route["is_recommended"]
-                else f"{abs(time_diff_vs_rec)} min faster, but {abs(score_diff_vs_rec)} pts lower safety score"
+                else f"{format_minutes(time_diff_vs_rec)} faster, but {abs(score_diff_vs_rec)} pts lower safety score"
                 if time_diff_vs_rec < 0
-                else f"+{time_diff_vs_rec} min slower and {abs(score_diff_vs_rec)} pts lower safety score"
+                else f"+{format_minutes(time_diff_vs_rec)} slower and {abs(score_diff_vs_rec)} pts lower safety score"
             ),
         }
 
