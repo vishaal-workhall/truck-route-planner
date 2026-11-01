@@ -1,3 +1,4 @@
+import { memo } from 'react';
 import {
   CheckCircle,
   Clock,
@@ -37,12 +38,12 @@ function hosSummary(route: RouteOption): string {
 }
 
 const CHIP_CLASS = {
-  safest: 'border-[#B7DCC6] bg-[#E6F3EC] text-[#0E5132]',
+  safest: 'border-[#D8CCF5] bg-[#F1ECFC] text-[#4C1D95]',
   fastest: 'border-[#C5D4E6] bg-[#E7EEF6] text-[#1E3A5F]',
   balanced: 'border-line bg-canvas text-ink',
 } as const;
 
-export function RouteStrip({
+export const RouteStrip = memo(function RouteStrip({
   routes,
   selectedRouteId,
   onSelectRoute,
@@ -147,9 +148,9 @@ export function RouteStrip({
       })}
     </div>
   );
-}
+});
 
-export function RouteInsight({
+export const RouteInsight = memo(function RouteInsight({
   routes,
   selectedRouteId,
   onSelectRoute,
@@ -166,7 +167,7 @@ export function RouteInsight({
       icon: Wind,
       title: 'Weather exposure',
       figure: `${safety.component_scores.weather_score}/100`,
-      detail: `Peak wind ${safety.peak_conditions.max_wind_mph} mph, rain ${safety.peak_conditions.max_rain_in_hr} in/h, snow ${safety.peak_conditions.max_snow_in_hr} in/h.`,
+      detail: `Peak wind ${safety.peak_conditions.max_wind_mph.toFixed(0)} mph, rain ${safety.peak_conditions.max_rain_in_hr.toFixed(2)} in/h, snow ${safety.peak_conditions.max_snow_in_hr.toFixed(2)} in/h.`,
     },
     {
       icon: Path,
@@ -319,7 +320,7 @@ export function RouteInsight({
                 <tr
                   key={route.id}
                   tabIndex={0}
-                  aria-selected={active}
+                  aria-current={active ? 'true' : undefined}
                   onClick={() => onSelectRoute(route.id)}
                   onKeyDown={(event) => {
                     if (event.key === 'Enter' || event.key === ' ') {
@@ -349,14 +350,14 @@ export function RouteInsight({
                   <td className="whitespace-nowrap px-3 py-2.5 font-mono">
                     <span className="mr-2 inline-flex items-center gap-1">
                       <Wind size={12} />
-                      {route.safety.peak_conditions.max_wind_mph} mph
+                      {route.safety.peak_conditions.max_wind_mph.toFixed(0)} mph
                     </span>
                     <span className="mr-2 inline-flex items-center gap-1">
                       <CloudRain size={12} />
-                      {route.safety.peak_conditions.max_rain_in_hr} in/h
+                      {route.safety.peak_conditions.max_rain_in_hr.toFixed(2)} in/h
                     </span>
                     <span className="inline-flex items-center gap-1">
-                      {route.safety.peak_conditions.max_snow_in_hr} in/h snow
+                      {route.safety.peak_conditions.max_snow_in_hr.toFixed(2)} in/h snow
                     </span>
                   </td>
                   <td className="whitespace-nowrap px-3 py-2.5 font-mono">
@@ -377,4 +378,4 @@ export function RouteInsight({
       </div>
     </section>
   );
-}
+});

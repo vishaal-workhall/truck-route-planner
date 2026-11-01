@@ -67,6 +67,20 @@ export function App() {
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [fieldErrors, setFieldErrors] = useState<Record<string, string[]>>({});
 
+  const selectRoute = useCallback((id: string) => {
+    setSelectedRouteId(id);
+    setFocusedCheckpoint(null);
+  }, []);
+
+  const clearFieldError = useCallback((field: string) => {
+    setFieldErrors((prev) => {
+      if (!prev[field]) return prev;
+      const next = { ...prev };
+      delete next[field];
+      return next;
+    });
+  }, []);
+
   const refreshHistory = useCallback(async () => {
     const items = await fetchRouteHistory().catch(() => []);
     setHistory(items);
@@ -315,10 +329,22 @@ export function App() {
           presets={rulesData?.presets ?? []}
           fieldErrors={fieldErrors}
           busy={isLoading}
-          onOrigin={setOrigin}
-          onDestination={setDestination}
-          onDeparture={setDepartureLocal}
-          onWeight={setLoadWeightLbs}
+          onOrigin={(value) => {
+            setOrigin(value);
+            clearFieldError('origin');
+          }}
+          onDestination={(value) => {
+            setDestination(value);
+            clearFieldError('destination');
+          }}
+          onDeparture={(value) => {
+            setDepartureLocal(value);
+            clearFieldError('departure_time');
+          }}
+          onWeight={(value) => {
+            setLoadWeightLbs(value);
+            clearFieldError('load_weight_lbs');
+          }}
           onSampling={setSamplingInterval}
           onTruck={setTruckType}
           onWeather={setWeatherMode}
@@ -342,10 +368,7 @@ export function App() {
               <CorridorMap
                 routes={planResult.routes}
                 selectedRouteId={selectedRouteId}
-                onSelectRoute={(id) => {
-                  setSelectedRouteId(id);
-                  setFocusedCheckpoint(null);
-                }}
+                onSelectRoute={selectRoute}
                 focusedCheckpoint={focusedCheckpoint}
                 onSelectCheckpoint={setFocusedCheckpoint}
                 heatmap={planResult.heatmap}
@@ -358,19 +381,13 @@ export function App() {
             <RouteStrip
               routes={planResult.routes}
               selectedRouteId={selectedRouteId}
-              onSelectRoute={(id) => {
-                setSelectedRouteId(id);
-                setFocusedCheckpoint(null);
-              }}
+onSelectRoute={selectRoute}
             />
           </section>
           <RouteInsight
             routes={planResult.routes}
             selectedRouteId={selectedRouteId}
-            onSelectRoute={(id) => {
-              setSelectedRouteId(id);
-              setFocusedCheckpoint(null);
-            }}
+            onSelectRoute={selectRoute}
           />
           {activeRoute ? (
             <CheckpointTimeline

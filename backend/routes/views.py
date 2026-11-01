@@ -16,6 +16,7 @@ from .services.risk_engine import (
 )
 from .services.routing_service import (
     FREIGHT_HUBS,
+    NoDrivableRoute,
     apply_hos_to_route,
     fetch_three_routes,
     geocode_location,
@@ -199,7 +200,13 @@ class PlanRouteAPIView(APIView):
             )
 
         # 2. Fetch 3 route options
-        raw_routes, routing_source = fetch_three_routes(origin_geo, destination_geo)
+        try:
+            raw_routes, routing_source = fetch_three_routes(origin_geo, destination_geo)
+        except NoDrivableRoute as exc:
+            return Response(
+                {"error": str(exc), "details": {"destination": [str(exc)]}},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         # 3. Sample checkpoints every 10 / 25 / 50 miles with HOS-aware ETAs
         for route in raw_routes:
@@ -254,7 +261,7 @@ class PlanRouteAPIView(APIView):
                 "routing": routing_source,
                 "weather": weather_source,
                 "is_simulated_weather": weather_source != "live_open_meteo",
-                "is_simulated_routing": routing_source == "simulated_fallback",
+                "is_simulated_routing": routing_source != "live_osrm",
                 "transparency_note": (
                     (
                         "Routes from the OSRM road network. "

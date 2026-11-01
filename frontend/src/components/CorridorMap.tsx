@@ -19,7 +19,7 @@ import {
   RISK_COLOR_MAP,
 } from '../utils/riskColors';
 import { ROLE_LABEL, routeChips, routeStroke } from '../utils/routeRoles';
-import { escapeHtml, routeRiskRuns } from '../utils/routeRiskSegments';
+import { escapeHtml, pointAtMile, routeRiskRuns, truckMileAt } from '../utils/routeRiskSegments';
 
 const METRIC_LEGEND_TITLE: Record<HeatmapMetric, string> = {
   risk: 'Risk',
@@ -77,6 +77,16 @@ export function CorridorMap({
   const truckMarkerRef = useRef<L.LayerGroup | null>(null);
   const canvasOverlayRef = useRef<HTMLCanvasElement | null>(null);
   const fittedPlanKeyRef = useRef<string>('');
+  const heatBoundsRef = useRef<L.LatLngBounds | null>(null);
+  const markersByIndexRef = useRef(new Map<number, L.CircleMarker>());
+  // Latest callbacks, read by Leaflet handlers, so parent re-renders never rebuild the layers
+  // (rebuilding would also close an open popup).
+  const onSelectRouteRef = useRef(onSelectRoute);
+  const onSelectCheckpointRef = useRef(onSelectCheckpoint);
+  useEffect(() => {
+    onSelectRouteRef.current = onSelectRoute;
+    onSelectCheckpointRef.current = onSelectCheckpoint;
+  });
 
   const [showHeatmap, setShowHeatmap] = useState<boolean>(true);
   const [heatmapMetric, setHeatmapMetric] = useState<HeatmapMetric>('risk');
@@ -104,7 +114,11 @@ export function CorridorMap({
       zoomControl: false,
       preferCanvas: true,
       renderer: new SafeCanvas() as L.Renderer,
+      // Don't hijack page scrolling; enable wheel zoom once the user clicks into the map.
+      scrollWheelZoom: false,
     });
+    map.on('click focus', () => map.scrollWheelZoom.enable());
+    map.on('mouseout blur', () => map.scrollWheelZoom.disable());
 
     L.control.zoom({ position: 'topright' }).addTo(map);
 
@@ -118,13 +132,23 @@ export function CorridorMap({
       { maxZoom: 16 }
     ).addTo(map);
 
-    // Heatmap lives in its own pane under the route lines, so it pans with the map for free
-    // and is hidden by Leaflet during zoom animation (leaflet-zoom-hide).
+    // Heatmap lives in its own pane under the route lines, so it pans with the map for free.
+    // During zoom it is scaled with the map (like L.ImageOverlay) and redrawn once zoom settles.
     const heatPane = map.createPane('heatmap');
     heatPane.style.zIndex = '350';
     heatPane.style.pointerEvents = 'none';
-    const canvas = L.DomUtil.create('canvas', 'leaflet-zoom-hide', heatPane);
+    const canvas = L.DomUtil.create('canvas', 'leaflet-zoom-animated', heatPane);
     canvasOverlayRef.current = canvas;
+    const animateHeatmap = (event: L.ZoomAnimEvent) => {
+      const bounds = heatBoundsRef.current;
+      if (!bounds) return;
+      const internal = map as unknown as {
+        _latLngBoundsToNewLayerBounds: (b: L.LatLngBounds, zoom: number, center: L.LatLng) => L.Bounds;
+      };
+      const offset = internal._latLngBoundsToNewLayerBounds(bounds, event.zoom, event.center).min;
+      if (offset) L.DomUtil.setTransform(canvas, offset, map.getZoomScale(event.zoom));
+    };
+    map.on('zoomanim', animateHeatmap);
 
     routeLayersRef.current = L.layerGroup().addTo(map);
     checkpointLayersRef.current = L.layerGroup().addTo(map);
@@ -170,6 +194,10 @@ export function CorridorMap({
       }
       const origin = map.containerPointToLayerPoint([-padX, -padY]);
       L.DomUtil.setPosition(canvas, origin);
+      heatBoundsRef.current = L.latLngBounds(
+        map.containerPointToLatLng([-padX, -padY]),
+        map.containerPointToLatLng([size.x + padX, size.y + padY])
+      );
       const ctx = canvas.getContext('2d');
       if (!ctx) return;
       if (!showHeatmap || !nodes.length) {
@@ -198,9 +226,10 @@ export function CorridorMap({
     };
 
     draw();
-    map.on('moveend zoomend resize', draw);
+    // A zoom also ends with moveend, so this redraws once per pan or zoom.
+    map.on('moveend resize', draw);
     return () => {
-      map.off('moveend zoomend resize', draw);
+      map.off('moveend resize', draw);
     };
   }, [heatmap, forecastHour, showHeatmap, heatmapMetric]);
 
@@ -245,6 +274,7 @@ export function CorridorMap({
 
     routeGroup.clearLayers();
     cpGroup.clearLayers();
+    markersByIndexRef.current.clear();
 
     // Draw unselected routes first so the selected route renders on top
     const orderedRoutes = [...routes].sort((a, b) =>
@@ -293,7 +323,7 @@ export function CorridorMap({
           dashArray: '7 8',
           lineCap: 'round',
         });
-        line.on('click', () => onSelectRoute(route.id));
+        line.on('click', () => onSelectRouteRef.current(route.id));
         line.bindTooltip(tooltip, { sticky: true });
         line.addTo(routeGroup);
       }
@@ -325,8 +355,8 @@ export function CorridorMap({
             weight: 1,
           });
           miniDot.on('click', () => {
-            onSelectRoute(route.id);
-            onSelectCheckpoint(cp);
+            onSelectRouteRef.current(route.id);
+            onSelectCheckpointRef.current(cp);
           });
           miniDot.addTo(cpGroup);
           continue;
@@ -385,64 +415,49 @@ export function CorridorMap({
         `;
 
         marker.bindPopup(popupHtml);
-        marker.on('click', () => onSelectCheckpoint(cp));
+        marker.on('click', () => onSelectCheckpointRef.current(cp));
         marker.addTo(cpGroup);
+        markersByIndexRef.current.set(cp.index, marker);
       }
     }
-  }, [
-    routes,
-    selectedRouteId,
-    checkpointForecastHour,
-    useSliderTimeForCheckpoints,
-    onSelectRoute,
-    onSelectCheckpoint,
-  ]);
+  }, [routes, selectedRouteId, checkpointForecastHour, useSliderTimeForCheckpoints]);
 
-  // Render simulated truck position along the active route at `forecastHour`
+  // Truck position along the selected route at `forecastHour` (stands still during HOS stops)
   useEffect(() => {
     const truckGroup = truckMarkerRef.current;
     if (!truckGroup || !selectedRoute) return;
     truckGroup.clearLayers();
+    if (forecastHour > selectedRoute.duration_minutes / 60 + 0.5) return;
 
-    const totalHours = Math.max(selectedRoute.duration_minutes / 60, 0.2);
-    if (forecastHour > totalHours + 0.5) return;
-
-    const cps = selectedRoute.checkpoints;
-    if (!cps.length) return;
-
-    let chosenCp = cps[0];
-    for (const cp of cps) {
-      if (cp.elapsed_hours <= forecastHour) {
-        chosenCp = cp;
-      } else {
-        break;
-      }
-    }
-
+    const { mile, stopped } = truckMileAt(selectedRoute, forecastHour);
     const truckIcon = L.divIcon({
       className: 'custom-truck-marker',
       html: `<div style="width:14px;height:14px;background:#17202b;border:2px solid #ffffff;box-shadow:0 0 0 1px #17202b;"></div>`,
       iconSize: [14, 14],
       iconAnchor: [7, 7],
     });
-
-    const marker = L.marker([chosenCp.lat, chosenCp.lng], {
-      icon: truckIcon,
-      zIndexOffset: 900,
-    });
+    const marker = L.marker(pointAtMile(selectedRoute, mile), { icon: truckIcon, zIndexOffset: 900 });
     marker.bindTooltip(
-      `Truck Position at +${forecastHour}h (Mile ${chosenCp.mile.toFixed(0)} - ${chosenCp.label})`,
+      `Truck at +${forecastHour}h: mile ${mile.toFixed(0)}${stopped ? ' (HOS stop)' : ''}`,
       { direction: 'top', offset: [0, -12] }
     );
     marker.addTo(truckGroup);
   }, [selectedRoute, forecastHour]);
 
-  // Pan to focused checkpoint when clicked in timeline
+  // Focused checkpoint (from the table or the map): bring the map into view, fly there, open its popup
   useEffect(() => {
     const map = mapInstanceRef.current;
-    if (!map || !focusedCheckpoint) return;
+    const container = mapContainerRef.current;
+    if (!map || !container || !focusedCheckpoint) return;
     const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-    map.flyTo([focusedCheckpoint.lat, focusedCheckpoint.lng], 7, {
+    const rect = container.getBoundingClientRect();
+    const visible = Math.min(rect.bottom, window.innerHeight) - Math.max(rect.top, 0);
+    if (visible < rect.height / 2) {
+      container.scrollIntoView({ block: 'center', behavior: reduceMotion ? 'auto' : 'smooth' });
+    }
+    const marker = markersByIndexRef.current.get(focusedCheckpoint.index);
+    map.once('moveend', () => marker?.openPopup());
+    map.flyTo([focusedCheckpoint.lat, focusedCheckpoint.lng], Math.max(map.getZoom(), 7), {
       duration: reduceMotion ? 0 : 0.6,
     });
   }, [focusedCheckpoint]);
@@ -515,7 +530,7 @@ export function CorridorMap({
         </div>
       </div>
 
-      <div className="flex flex-wrap gap-2 border-b border-line px-4 py-2">
+      <div className="hidden flex-wrap gap-2 border-b border-line px-4 py-2 sm:flex">
         {routes.map((route) => {
           const isSelected = route.id === selectedRouteId;
           const chips = routeChips(route, routes);
@@ -561,12 +576,12 @@ export function CorridorMap({
             <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
               <span className="text-muted">{METRIC_LEGEND_TITLE[heatmapMetric]}</span>
               {METRIC_BANDS[heatmapMetric]
-                .filter((band) => band.label)
+                .filter((band) => band.label && band.alpha > 0)
                 .map((band) => (
                   <span key={band.label} className="inline-flex items-center gap-1.5 font-mono">
                     <span
                       className="h-2 w-3"
-                      style={{ backgroundColor: `rgb(${band.rgb.join(',')})`, opacity: band.alpha ? 0.85 : 0.25 }}
+                      style={{ backgroundColor: `rgb(${band.rgb.join(',')})`, opacity: 0.85 }}
                       aria-hidden
                     />
                     {band.label}
@@ -582,7 +597,10 @@ export function CorridorMap({
           <div className="flex flex-wrap items-center gap-2">
             <button
               type="button"
-              onClick={() => setIsPlaying((playing) => !playing)}
+              onClick={() => {
+                if (!isPlaying) onToggleSliderTimeMode(true);
+                setIsPlaying((playing) => !playing);
+              }}
               className="inline-flex min-h-10 cursor-pointer items-center gap-1.5 border border-line bg-white px-2.5 text-xs font-medium hover:bg-canvas focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ink"
             >
               {isPlaying ? <Pause size={14} weight="fill" /> : <Play size={14} weight="fill" />}
@@ -630,6 +648,8 @@ export function CorridorMap({
             value={forecastHour}
             onChange={(event) => {
               setIsPlaying(false);
+              // Scrubbing time shows every layer at that hour, so colours agree with the heatmap.
+              onToggleSliderTimeMode(true);
               onChangeForecastHour(Number(event.target.value));
             }}
             aria-label="Forecast hour, 0 to 48"

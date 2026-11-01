@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { memo, useState } from 'react';
 import { Warning } from '@phosphor-icons/react';
 import type { RouteCheckpoint, RouteOption } from '../types/routing';
 import { formatEtaTimestamp, RISK_COLOR_MAP } from '../utils/riskColors';
@@ -10,7 +10,7 @@ interface CheckpointTimelineProps {
   focusedCheckpointIndex: number | null;
 }
 
-export function CheckpointTimeline({
+export const CheckpointTimeline = memo(function CheckpointTimeline({
   route,
   samplingIntervalMiles,
   onSelectCheckpoint,
@@ -63,13 +63,14 @@ export function CheckpointTimeline({
           <span>Mile 0</span>
           <span>Mile {route.distance_miles.toFixed(0)}</span>
         </div>
-        <div className="flex h-2 w-full">
+        <div className="flex h-2 w-full" aria-hidden>
           {checkpoints.map((cp) => {
             const cfg = RISK_COLOR_MAP[cp.risk.overall_risk] || RISK_COLOR_MAP.Low;
             return (
               <button
                 key={cp.index}
                 type="button"
+                tabIndex={-1}
                 onClick={() => onSelectCheckpoint(cp)}
                 title={`Mile ${cp.mile.toFixed(0)}, ${cp.label}: ${cp.risk.overall_risk}`}
                 aria-label={`Mile ${cp.mile.toFixed(0)}, ${cp.risk.overall_risk}`}
@@ -159,4 +160,4 @@ export function CheckpointTimeline({
       )}
     </section>
   );
-}
+});

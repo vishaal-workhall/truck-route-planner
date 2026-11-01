@@ -88,7 +88,7 @@ export function RulesView({ rulesData, status }: RulesViewProps) {
           </div>
           <ol className="list-decimal space-y-2 px-8 py-4 text-sm leading-6">
             {rulesData.rules.recommendation_priority.map((item) => (
-              <li key={item}>{item}</li>
+              <li key={item}>{item.replace(/^\d+\.\s*/, '')}</li>
             ))}
           </ol>
         </section>

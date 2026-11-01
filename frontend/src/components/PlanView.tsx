@@ -55,6 +55,7 @@ export function PlanView(props: PlanViewProps) {
   return (
     <div className="view-enter grid items-start gap-4 lg:grid-cols-[minmax(0,640px)_minmax(260px,1fr)]">
       <form
+        noValidate
         className="border border-line bg-white"
         onSubmit={(event) => {
           event.preventDefault();
@@ -83,7 +84,7 @@ export function PlanView(props: PlanViewProps) {
               list="freight-hub-suggestions"
               value={props.origin}
               onChange={(event) => props.onOrigin(event.target.value)}
-              placeholder="Mumbai"
+              placeholder="Chicago, IL"
               aria-invalid={Boolean(props.fieldErrors.origin)}
               aria-describedby={
                 props.fieldErrors.origin ? 'origin-input-error' : 'origin-input-hint'
@@ -113,7 +114,7 @@ export function PlanView(props: PlanViewProps) {
               list="freight-hub-suggestions"
               value={props.destination}
               onChange={(event) => props.onDestination(event.target.value)}
-              placeholder="Delhi"
+              placeholder="Denver, CO"
               aria-invalid={Boolean(props.fieldErrors.destination)}
               aria-describedby={
                 props.fieldErrors.destination ? 'destination-input-error' : undefined
@@ -171,7 +172,7 @@ export function PlanView(props: PlanViewProps) {
               type="number"
               min={1000}
               max={120000}
-              step={500}
+              step="any"
               value={props.loadWeightLbs}
               onChange={(event) => props.onWeight(Number(event.target.value))}
               aria-invalid={Boolean(props.fieldErrors.load_weight_lbs)}

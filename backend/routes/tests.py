@@ -53,10 +53,10 @@ class WeatherAndLoadRiskRulesTests(TestCase):
         self.assertEqual(classify_snow_risk(3.2), RISK_NO_TRAVEL)
 
     def test_load_wind_escalation_rules(self):
-        # Rule 1: >= 55 mph -> No Travel for any load
+        # Rule 1: >= 55 mph -> No Travel for any load (not a weight escalation, so no load note)
         risk, note = apply_load_wind_rules(56.0, 12000)
         self.assertEqual(risk, RISK_NO_TRAVEL)
-        self.assertIsNotNone(note)
+        self.assertIsNone(note)
 
         # Rule 2: 45-54 mph + > 30,000 lb -> No Travel
         risk_heavy, note_heavy = apply_load_wind_rules(48.0, 32000)
@@ -158,7 +158,7 @@ class RouteRecommendationAndSafetyScoreTests(TestCase):
             ranked[0]["safety"]["overall_safety_score"],
             ranked[1]["safety"]["overall_safety_score"],
         )
-        self.assertIn("Route Safety Score", ranked[0]["safety"]["why_this_route"])
+        self.assertIn("Safety Score", ranked[0]["safety"]["why_this_route"])
 
 
 class RoutePlannerAPITests(TestCase):
@@ -227,6 +227,7 @@ class RoutePlannerAPITests(TestCase):
 # ---------------------------------------------------------------------------------------------
 
 from datetime import datetime, timedelta, timezone as dt_timezone
+import math
 from unittest import mock
 
 from django.core.cache import cache
@@ -415,7 +416,7 @@ class WeatherTimeAlignmentTests(TestCase):
 
         self.assertEqual(captured["start_hour"], "2026-11-02T18:00")
         for cp in route["checkpoints"]:
-            expected_hour = round(-20 / 60 + cp["elapsed_hours"])
+            expected_hour = math.floor(-20 / 60 + cp["elapsed_minutes"] / 60 + 0.5)
             self.assertEqual(cp["weather"]["wind_mph"], float(expected_hour), cp["mile"])
 
     def test_rain_includes_convective_showers(self):
@@ -499,3 +500,75 @@ class LiveLocationBudgetTests(TestCase):
         self.assertLessEqual(resolution, 0.25)
         self.assertLessEqual(len({_point_key(a, b, resolution) for a, b in points}), LIVE_LOCATION_BUDGET)
         self.assertEqual(resolution, 0.25)
+
+
+
+class AuditRegressionTests(RouteRecommendationAndSafetyScoreTests):
+    """Regressions for bugs found in the final audit."""
+
+    def test_55_mph_is_not_reported_as_a_load_rule(self):
+        risk = evaluate_checkpoint_risk(60.0, 0.0, 0.0, 10000)
+        self.assertEqual(risk["overall_risk"], RISK_NO_TRAVEL)
+        self.assertFalse(risk["load_rule_triggered"])
+        route = self._make_mock_route("r", "R", 200.0, [60.0, 10.0], 10000)
+        ranked = rank_and_explain_routes([route], 10000, "dry_van")
+        self.assertNotIn("30,000", ranked[0]["safety"]["load_analysis"]["suitability_status"])
+
+    def test_recommendation_text_matches_the_numbers(self):
+        # A has no No-Travel but more Severe miles than B and C (which each have No-Travel).
+        a = self._make_mock_route("a", "Route A: a", 300.0, [46.0, 46.0, 46.0, 10.0], 20000)
+        b = self._make_mock_route("b", "Route B: b", 290.0, [56.0, 10.0, 10.0, 10.0], 20000)
+        c = self._make_mock_route("c", "Route C: c", 280.0, [56.0, 46.0, 10.0, 10.0], 20000)
+        ranked = rank_and_explain_routes([a, b, c], 20000, "dry_van")
+        rec = ranked[0]
+        self.assertEqual(rec["id"], "a")
+        text = " ".join(r["text"] for r in rec["safety"]["key_reasons"]) + rec["safety"]["why_this_route"]
+        self.assertNotIn("lowest of all", text)
+        self.assertIn("0 No-Travel miles vs 50", text)
+        self.assertNotIn("fastest of the three", text)
+
+    def test_tied_risk_alternative_is_not_called_more_exposed(self):
+        fast = self._make_mock_route("fast", "Route A: f", 200.0, [10.0, 26.0, 10.0, 10.0], 20000)
+        slow = self._make_mock_route("slow", "Route B: s", 260.0, [10.0, 10.0, 26.0, 10.0], 20000)
+        ranked = rank_and_explain_routes([slow, fast], 20000, "dry_van")
+        self.assertEqual(ranked[0]["id"], "fast")
+        self.assertNotIn("more exposed", ranked[1]["safety"]["why_this_route"])
+        self.assertIn("about the same", ranked[1]["safety"]["why_this_route"])
+
+    def test_near_fastest_route_is_not_called_fastest(self):
+        calm = self._make_mock_route("calm", "Route A: c", 203.0, [10.0, 10.0], 20000)
+        breezy = self._make_mock_route("breezy", "Route B: b", 200.0, [30.0, 30.0], 20000)
+        ranked = rank_and_explain_routes([breezy, calm], 20000, "dry_van")
+        self.assertEqual(ranked[0]["id"], "calm")
+        self.assertIn("within 3 min of the fastest", ranked[0]["safety"]["why_this_route"])
+
+
+class GeocodeAndRoutingEdgeTests(TestCase):
+    def test_partial_names_do_not_match_other_hubs(self):
+        from .services.routing_service import geocode_location
+
+        with mock.patch("routes.services.routing_service.requests.get", side_effect=Exception("no network")):
+            for query in ("York", "Lake City", "CA"):
+                try:
+                    result = geocode_location(query)
+                except Exception:
+                    continue
+                self.assertNotEqual(result["source"], "freight_hub_directory", query)
+        self.assertEqual(geocode_location("Denver")["name"], "Denver, CO")
+        self.assertEqual(geocode_location("denver,co")["name"], "Denver, CO")
+
+    def _osrm(self, payload, status_code=200):
+        response = mock.Mock(status_code=status_code)
+        response.json.return_value = payload
+        return response
+
+    def test_far_snapped_or_unroutable_trips_are_rejected(self):
+        from .services.routing_service import NoDrivableRoute, fetch_three_routes
+
+        origin = {"lat": 40.71, "lng": -74.0}
+        destination = {"lat": 51.5, "lng": -0.12}
+        snapped = {"code": "Ok", "waypoints": [{"distance": 5_534_803}, {"distance": 10}], "routes": [{}]}
+        for payload, code in ((snapped, 200), ({"code": "NoRoute"}, 400)):
+            with mock.patch("routes.services.routing_service.requests.get", return_value=self._osrm(payload, code)):
+                with self.assertRaises(NoDrivableRoute):
+                    fetch_three_routes(origin, destination)

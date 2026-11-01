@@ -120,7 +120,7 @@ def geocode_location(query: str) -> Dict[str, Any]:
             except ValueError:
                 pass
 
-    # 2. Check curated freight hubs (exact or city-prefix match)
+    # 2. Check curated freight hubs (exact "city, st" or exact city name)
     lower_q = cleaned.lower()
     if lower_q in FREIGHT_HUBS:
         hub = FREIGHT_HUBS[lower_q]
@@ -133,7 +133,7 @@ def geocode_location(query: str) -> Dict[str, Any]:
 
     for key, hub in FREIGHT_HUBS.items():
         city_only = key.split(",")[0].strip()
-        if lower_q == city_only or lower_q in key:
+        if lower_q == city_only or lower_q.replace(" ", "") == key.replace(" ", ""):
             return {
                 "name": hub["name"],
                 "lat": hub["lat"],
@@ -194,7 +194,7 @@ def geocode_location(query: str) -> Dict[str, Any]:
         pass
 
     raise ValueError(
-        f"Could not resolve location '{query}'. Try a city such as 'Mumbai' or 'Chicago, IL'."
+        f"Could not resolve location '{query}'. Try a city such as 'Chicago, IL' or 'Denver, CO'."
     )
 
 
@@ -220,7 +220,19 @@ def _extract_osrm_corridor_name(osrm_route: Dict[str, Any], index: int, default_
     return f"Route {chr(65 + index)}: {default_label}"
 
 
+# OSRM snaps each coordinate to the nearest road; beyond this the "route" starts somewhere else.
+MAX_SNAP_METERS = 25_000
+
+
+class NoDrivableRoute(ValueError):
+    """The routing API is reachable but has no road route between the two places."""
+
+
 def _query_osrm_Single(coords_str: str) -> List[Dict[str, Any]]:
+    """
+    Routes for `coords_str`, or [] when OSRM has no road route or had to snap the origin or
+    destination more than MAX_SNAP_METERS away. Raises RequestException if OSRM is unavailable.
+    """
     url = f"{settings.OSRM_BASE_URL}/route/v1/driving/{coords_str}"
     resp = requests.get(
         url,
@@ -232,10 +244,19 @@ def _query_osrm_Single(coords_str: str) -> List[Dict[str, Any]]:
         },
         timeout=5.5,
     )
-    if resp.status_code != 200:
+    try:
+        payload = resp.json()
+    except ValueError:
+        payload = {}
+    code = payload.get("code")
+    if code in ("NoRoute", "NoSegment"):
         return []
-    payload = resp.json()
-    if payload.get("code") != "Ok":
+    if resp.status_code != 200 or code != "Ok":
+        raise requests.RequestException(f"OSRM returned HTTP {resp.status_code} ({code})")
+    waypoints = payload.get("waypoints") or []
+    if waypoints and max(
+        float(waypoints[0].get("distance") or 0.0), float(waypoints[-1].get("distance") or 0.0)
+    ) > MAX_SNAP_METERS:
         return []
     return payload.get("routes") or []
 
@@ -316,6 +337,10 @@ def fetch_three_routes(
         # 1. Primary OSRM call requesting up to 3 alternatives
         direct_coords = f"{lng1},{lat1};{lng2},{lat2}"
         osrm_routes = _query_osrm_Single(direct_coords)
+        if not osrm_routes:
+            raise NoDrivableRoute(
+                "No drivable road route connects these places. Check the origin and destination."
+            )
         for idx, r in enumerate(osrm_routes[:3]):
             geojson_coords = r["geometry"]["coordinates"]
             lat_lng_coords = [[ round(pt[1], 5), round(pt[0], 5) ] for pt in geojson_coords]
@@ -358,7 +383,10 @@ def fetch_three_routes(
                 mid_lat = (lat1 + lat2) / 2.0 + perp_lat * deflection_deg * sign
                 mid_lng = (lng1 + lng2) / 2.0 + perp_lng * deflection_deg * sign
                 wp_coords = f"{lng1},{lat1};{mid_lng:.4f},{mid_lat:.4f};{lng2},{lat2}"
-                alt_list = _query_osrm_Single(wp_coords)
+                try:
+                    alt_list = _query_osrm_Single(wp_coords)
+                except requests.RequestException:
+                    continue
                 if alt_list:
                     r = alt_list[0]
                     dist_miles = round(float(r["distance"]) * 0.000621371, 1)

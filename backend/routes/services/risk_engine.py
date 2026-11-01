@@ -130,10 +130,7 @@ def apply_load_wind_rules(
     base_wind_risk = classify_wind_risk(wind_mph)
 
     if wind_mph >= 55.0:
-        return (
-            RISK_NO_TRAVEL,
-            f"Wind {wind_mph:.0f} mph (>= 55 mph threshold) mandates No Travel for any load weight.",
-        )
+        return RISK_NO_TRAVEL, None  # No Travel for every load, so not a load escalation
 
     if 45.0 <= wind_mph < 55.0 and load_weight_lbs > 30000:
         return (
@@ -287,6 +284,7 @@ def score_and_summarize_route(
 
     weighted_risk_sum = 0.0
     load_escalation_count = 0
+    load_no_travel_count = 0
     load_escalation_miles = 0.0
     load_escalation_examples: List[str] = []
 
@@ -315,6 +313,8 @@ def score_and_summarize_route(
         peak_snow_in_hr = max(peak_snow_in_hr, snow)
 
         if cp["risk"]["load_rule_triggered"]:
+            if cp["risk"]["effective_wind_risk"] == RISK_NO_TRAVEL:
+                load_no_travel_count += 1
             load_escalation_count += 1
             load_escalation_miles += seg_miles
             if len(load_escalation_examples) < 2 and cp["risk"]["load_escalation_note"]:
@@ -427,10 +427,10 @@ def score_and_summarize_route(
             break
 
     # Determine load suitability status label
-    if no_travel_miles > 0 and load_escalation_count > 0:
+    if load_no_travel_count > 0:
         load_suitability_status = "Unsafe for Load (>30,000 lb Wind Rule Triggered)"
     elif no_travel_miles > 0:
-        load_suitability_status = "Do Not Dispatch (>=55 mph / Extreme Hazard)"
+        load_suitability_status = "Do Not Dispatch (No-Travel Conditions)"
     elif severe_miles > 0 and load_escalation_count > 0:
         load_suitability_status = "High Rollover Risk (>40,000 lb Wind Escalation)"
     elif load_suitability_score >= 82:
@@ -489,6 +489,37 @@ def score_and_summarize_route(
     }
 
 
+# Average risk within this of the best route counts as a tie (1-5 scale), so a negligible
+# risk edge cannot outweigh a much shorter trip; travel time then decides.
+AVG_RISK_TOLERANCE = 0.1
+
+# How a route compares on ranking criterion i when it wins / loses on it.
+CRITERION_BETTER: Dict[int, str] = {
+    0: "fewer No-Travel miles",
+    1: "fewer Severe miles",
+    2: "fewer High-risk miles",
+    3: "lower average weather risk",
+}
+CRITERION_WORSE: Dict[int, str] = {
+    0: "more No-Travel miles",
+    1: "more Severe miles",
+    2: "more High-risk miles",
+    3: "higher average weather risk",
+}
+
+
+def _rank_key(route: Dict[str, Any], best_avg: float) -> Tuple[float, float, float, int, float]:
+    """Assessment priority: No-Travel, Severe, High miles, average risk (with tolerance), time."""
+    miles = route["safety"]["risk_miles"]
+    return (
+        round(miles["no_travel_miles"], 1),
+        round(miles["severe_miles"], 1),
+        round(miles["high_miles"], 1),
+        int((route["safety"]["average_risk_score"] - best_avg) / AVG_RISK_TOLERANCE + 1e-9),
+        round(route["duration_minutes"], 1),
+    )
+
+
 def rank_and_explain_routes(
     routes: List[Dict[str, Any]],
     load_weight_lbs: int,
@@ -521,27 +552,10 @@ def rank_and_explain_routes(
         )
         route["safety"] = safety_summary
 
-    # Sort using the exact assessment specification rules:
-    # 1. Fewest No Travel + Severe miles (checking no_travel_miles first, then severe_miles)
-    # 2. Fewest High miles
-    # 3. Lowest average risk
-    # 4. Shortest travel times
-    # Average risk within 0.1 (on the 1-5 scale) of the best route counts as a tie, so a
-    # negligible risk edge cannot outweigh a much shorter trip; travel time then decides.
-    AVG_RISK_TOLERANCE = 0.1
     best_avg = min(r["safety"]["average_risk_score"] for r in routes)
-    sorted_routes = sorted(
-        routes,
-        key=lambda r: (
-            round(r["safety"]["risk_miles"]["no_travel_miles"], 1),
-            round(r["safety"]["risk_miles"]["severe_miles"], 1),
-            round(r["safety"]["risk_miles"]["high_miles"], 1),
-            int((r["safety"]["average_risk_score"] - best_avg) / AVG_RISK_TOLERANCE + 1e-9),
-            round(r["duration_minutes"], 1),
-        ),
-    )
+    sorted_routes = sorted(routes, key=lambda r: _rank_key(r, best_avg))
 
-    # Ensure safety scores strictly respect rank order when two routes are close
+    # Keep the explanatory Safety Score consistent with the rank order.
     for idx, route in enumerate(sorted_routes):
         route["rank"] = idx + 1
         route["is_recommended"] = idx == 0
@@ -550,19 +564,37 @@ def rank_and_explain_routes(
         if idx > 0:
             prev_score = sorted_routes[idx - 1]["safety"]["overall_safety_score"]
             if route["safety"]["overall_safety_score"] >= prev_score:
-                route["safety"]["overall_safety_score"] = max(5, prev_score - 3)
+                route["safety"]["overall_safety_score"] = max(0, prev_score - 3)
 
     recommended = sorted_routes[0]
+    runner_up = sorted_routes[1] if len(sorted_routes) > 1 else None
     fastest = min(sorted_routes, key=lambda r: r["duration_minutes"])
 
-    rec_miles = recommended["safety"]["risk_miles"]
-    fast_miles = fastest["safety"]["risk_miles"]
-    if rec_miles["severe_plus_no_travel_miles"] < fast_miles["severe_plus_no_travel_miles"]:
-        avoided_on_fastest = "Severe and No-Travel weather"
-    elif rec_miles["high_miles"] < fast_miles["high_miles"]:
-        avoided_on_fastest = "High-risk weather"
-    else:
-        avoided_on_fastest = "weather risk"
+    def deciding(better: Dict[str, Any], worse: Dict[str, Any]) -> Optional[int]:
+        """Index of the first ranking criterion on which `better` beats `worse` (None if tied)."""
+        for i, (a, b) in enumerate(zip(_rank_key(better, best_avg), _rank_key(worse, best_avg))):
+            if a != b:
+                return i
+        return None
+
+    def comparison_sentence(better: Dict[str, Any], worse: Dict[str, Any]) -> str:
+        i = deciding(better, worse)
+        bm, wm = better["safety"]["risk_miles"], worse["safety"]["risk_miles"]
+        if i == 0:
+            return f"{bm['no_travel_miles']:.0f} No-Travel miles vs {wm['no_travel_miles']:.0f} on {worse['name']}."
+        if i == 1:
+            return f"{bm['severe_miles']:.0f} Severe miles vs {wm['severe_miles']:.0f} on {worse['name']}."
+        if i == 2:
+            return f"{bm['high_miles']:.0f} High-risk miles vs {wm['high_miles']:.0f} on {worse['name']}."
+        if i == 3:
+            return (
+                f"Average risk {better['safety']['average_risk_score']}/5 vs "
+                f"{worse['safety']['average_risk_score']}/5 on {worse['name']}."
+            )
+        if i == 4:
+            gap = format_minutes(worse["duration_minutes"] - better["duration_minutes"])
+            return f"Weather risk is about the same as {worse['name']}, and it is {gap} faster."
+        return f"It ties with {worse['name']} on every criterion."
 
     for route in sorted_routes:
         rm = route["safety"]["risk_miles"]
@@ -577,30 +609,18 @@ def rank_and_explain_routes(
             route["safety"]["overall_safety_score"]
             - recommended["safety"]["overall_safety_score"]
         )
+        is_fastest = route["id"] == fastest["id"]
 
-        # Compare against the riskiest alternative to quantify avoided hazard miles
-        worst_route = sorted_routes[-1]
-        avoided_no_travel = max(
-            0.0,
-            round(
-                worst_route["safety"]["risk_miles"]["no_travel_miles"] - rm["no_travel_miles"],
-                1,
-            ),
-        )
-        avoided_severe = max(
-            0.0,
-            round(
-                worst_route["safety"]["risk_miles"]["severe_miles"] - rm["severe_miles"],
-                1,
-            ),
-        )
-        avoided_high = max(
-            0.0,
-            round(
-                worst_route["safety"]["risk_miles"]["high_miles"] - rm["high_miles"],
-                1,
-            ),
-        )
+        if is_fastest:
+            time_note = "It is also the fastest of the three options."
+        elif time_diff_vs_fastest <= 5:
+            time_note = f"It is within {format_minutes(time_diff_vs_fastest)} of the fastest option."
+        else:
+            gains = CRITERION_BETTER.get(deciding(route, fastest), "lower weather risk")
+            time_note = (
+                f"It takes {format_minutes(time_diff_vs_fastest)} longer than {fastest['name']} "
+                f"in exchange for {gains}."
+            )
 
         key_reasons: List[Dict[str, str]] = []
 
@@ -609,88 +629,58 @@ def rank_and_explain_routes(
                 key_reasons.append(
                     {
                         "type": "positive",
-                        "text": f"Zero No-Travel or Severe weather miles across the entire {route['distance_miles']:.0f}-mile corridor.",
+                        "text": f"No No-Travel or Severe weather across the {route['distance_miles']:.0f}-mile route.",
                     }
                 )
-            else:
+            elif rm["no_travel_miles"] > 0:
                 key_reasons.append(
                     {
-                        "type": "positive",
-                        "text": f"Minimizes Severe/No-Travel exposure ({rm['severe_plus_no_travel_miles']:.0f} mi total, lowest of all 3 options).",
-                    }
-                )
-
-            if avoided_no_travel > 0 or avoided_severe > 0:
-                key_reasons.append(
-                    {
-                        "type": "positive",
-                        "text": f"Avoids {avoided_no_travel + avoided_severe:.0f} miles of Severe/No-Travel weather present on {worst_route['name']}.",
-                    }
-                )
-            elif avoided_high > 0:
-                key_reasons.append(
-                    {
-                        "type": "positive",
-                        "text": f"Reduces High-risk weather exposure by {avoided_high:.0f} miles compared to {worst_route['name']}.",
-                    }
-                )
-
-            if load_info["escalation_checkpoints_count"] == 0:
-                key_reasons.append(
-                    {
-                        "type": "positive",
-                        "text": f"Stays below wind-escalation thresholds for your {load_weight_lbs:,} lb load (peak wind {peaks['max_wind_mph']:.0f} mph).",
+                        "type": "critical",
+                        "text": f"Still crosses {rm['no_travel_miles']:.0f} No-Travel miles: every option does. Consider a later departure.",
                     }
                 )
             else:
                 key_reasons.append(
                     {
                         "type": "warning",
-                        "text": f"Has {load_info['escalation_checkpoints_count']} load-wind escalation checkpoint(s), still fewer than alternatives.",
+                        "text": f"Crosses {rm['severe_miles']:.0f} Severe miles; every option has Severe or No-Travel weather.",
                     }
                 )
-
-            if time_diff_vs_fastest <= 5:
+            if runner_up is not None:
+                key_reasons.append(
+                    {"type": "positive", "text": f"Ranked first: {comparison_sentence(route, runner_up)}"}
+                )
+            if load_info["escalation_checkpoints_count"] == 0:
                 key_reasons.append(
                     {
                         "type": "positive",
-                        "text": "Matches the fastest travel time while delivering the highest safety score.",
+                        "text": f"No checkpoint where your {load_weight_lbs:,} lb load raises the wind risk (peak wind {peaks['max_wind_mph']:.0f} mph).",
                     }
                 )
             else:
                 key_reasons.append(
                     {
-                        "type": "info",
-                        "text": f"Adds {format_minutes(time_diff_vs_fastest)} over the fastest route ({fastest['name']}) to reduce {avoided_on_fastest}.",
+                        "type": "warning",
+                        "text": f"{load_info['escalation_checkpoints_count']} checkpoint(s) where your {load_weight_lbs:,} lb load raises the wind risk.",
                     }
                 )
-
-            # Plain-language "Why this route?" narrative
-            hazard_avoidance_clause = ""
-            if avoided_no_travel > 0 or avoided_severe > 0:
-                hazard_avoidance_clause = (
-                    f" It bypasses {avoided_no_travel + avoided_severe:.0f} miles of Severe and No-Travel "
-                    f"conditions on {worst_route['name']} (where winds reach {worst_route['safety']['peak_conditions']['max_wind_mph']:.0f} mph "
-                    f"and snow/rain peaks at {max(worst_route['safety']['peak_conditions']['max_snow_in_hr'], worst_route['safety']['peak_conditions']['max_rain_in_hr']):.2f} in/hr)."
-                )
-            elif avoided_high > 0:
-                hazard_avoidance_clause = (
-                    f" It cuts High-risk weather exposure by {avoided_high:.0f} miles compared with {worst_route['name']}."
-                )
-
-            time_tradeoff_clause = (
-                " It is also the fastest corridor available, requiring no schedule trade-off."
-                if time_diff_vs_fastest <= 5
-                else f" While it takes {format_minutes(time_diff_vs_fastest)} longer than {fastest['name']}, the extra travel time keeps your {load_weight_lbs:,} lb {load_info['truck_type_label']} out of high-risk weather cells."
+            key_reasons.append(
+                {"type": "positive" if time_diff_vs_fastest <= 5 else "info", "text": time_note}
             )
 
             why_this_route = (
-                f"{route['name']} is recommended with a Route Safety Score of {route['safety']['overall_safety_score']}/100 "
-                f"and an average checkpoint risk of {route['safety']['average_risk_score']}/5.0."
-                f"{hazard_avoidance_clause}{time_tradeoff_clause}"
+                f"{route['name']} is recommended (Safety Score {route['safety']['overall_safety_score']}/100, "
+                f"average checkpoint risk {route['safety']['average_risk_score']}/5)."
+                + (f" {comparison_sentence(route, runner_up)}" if runner_up is not None else "")
+                + f" {time_note}"
+            )
+            headline = (
+                "Recommended: best balance of safety and travel time"
+                if time_diff_vs_fastest <= 5
+                else f"Recommended: +{format_minutes(time_diff_vs_fastest)} vs fastest for "
+                f"{CRITERION_BETTER.get(deciding(route, fastest), 'lower weather risk')}"
             )
         else:
-            # Alternative route explanations
             if rm["no_travel_miles"] > 0:
                 key_reasons.append(
                     {
@@ -702,7 +692,7 @@ def rank_and_explain_routes(
                 key_reasons.append(
                     {
                         "type": "critical",
-                        "text": f"Exposes truck to {rm['severe_miles']:.0f} miles of Severe weather risk along the corridor.",
+                        "text": f"Exposes the truck to {rm['severe_miles']:.0f} miles of Severe weather.",
                     }
                 )
             if rm["high_miles"] > 0:
@@ -713,37 +703,36 @@ def rank_and_explain_routes(
                     }
                 )
             if load_info["escalation_examples"]:
-                key_reasons.append(
-                    {
-                        "type": "critical",
-                        "text": load_info["escalation_examples"][0],
-                    }
+                key_reasons.append({"type": "critical", "text": load_info["escalation_examples"][0]})
+
+            loses_on = deciding(recommended, route)
+            if loses_on == 4 or loses_on is None:
+                verdict = (
+                    f"Its weather risk is about the same as {recommended['name']}, "
+                    f"but it is {format_minutes(time_diff_vs_rec)} slower."
                 )
-            if time_diff_vs_rec < 0:
-                key_reasons.append(
-                    {
-                        "type": "info",
-                        "text": f"Saves {format_minutes(time_diff_vs_rec)} vs recommended route, but loses {abs(score_diff_vs_rec)} Safety Score points.",
-                    }
-                )
+                headline = f"Similar risk, +{format_minutes(time_diff_vs_rec)} slower"
             else:
-                key_reasons.append(
-                    {
-                        "type": "warning",
-                        "text": f"Takes {format_minutes(time_diff_vs_rec)} longer than {recommended['name']} with {abs(score_diff_vs_rec)} lower Safety Score.",
-                    }
-                )
+                worse_on = CRITERION_WORSE[loses_on]
+                if time_diff_vs_rec < 0:
+                    verdict = (
+                        f"It is {format_minutes(time_diff_vs_rec)} faster than {recommended['name']}, "
+                        f"but has {worse_on}, which ranks first."
+                    )
+                    headline = f"{format_minutes(time_diff_vs_rec)} faster, but {worse_on}"
+                else:
+                    verdict = (
+                        f"It is slower (+{format_minutes(time_diff_vs_rec)}) and has {worse_on} "
+                        f"than {recommended['name']}."
+                    )
+                    headline = f"+{format_minutes(time_diff_vs_rec)} slower and {worse_on}"
+            key_reasons.append({"type": "info" if time_diff_vs_rec < 0 else "warning", "text": verdict})
 
             why_this_route = (
                 f"Ranked #{route['rank']} ({route['safety']['overall_safety_score']}/100). "
-                f"Compared to {recommended['name']}, this corridor encounters "
-                f"{rm['no_travel_miles']:.0f} No-Travel miles, {rm['severe_miles']:.0f} Severe miles, and {rm['high_miles']:.0f} High-risk miles "
-                f"(average risk {route['safety']['average_risk_score']}/5.0 vs {recommended['safety']['average_risk_score']}/5.0). "
-                + (
-                    f"Even though it is {format_minutes(time_diff_vs_rec)} faster, the weather and load risks outweigh the time savings."
-                    if time_diff_vs_rec < 0
-                    else f"It is both slower (+{format_minutes(time_diff_vs_rec)}) and more exposed to weather hazards than {recommended['name']}."
-                )
+                f"This route has {rm['no_travel_miles']:.0f} No-Travel, {rm['severe_miles']:.0f} Severe and "
+                f"{rm['high_miles']:.0f} High-risk miles (average risk {route['safety']['average_risk_score']}/5 vs "
+                f"{recommended['safety']['average_risk_score']}/5 on {recommended['name']}). {verdict}"
             )
 
         route["safety"]["why_this_route"] = why_this_route
@@ -753,16 +742,8 @@ def rank_and_explain_routes(
             "vs_recommended_miles": dist_diff_vs_rec,
             "vs_recommended_safety_score": score_diff_vs_rec,
             "vs_fastest_minutes": time_diff_vs_fastest,
-            "is_fastest": route["id"] == fastest["id"],
-            "tradeoff_headline": (
-                "Recommended: Optimal balance of safety and travel time"
-                if route["is_recommended"] and time_diff_vs_fastest <= 5
-                else f"Recommended: +{format_minutes(time_diff_vs_fastest)} vs fastest to reduce {avoided_on_fastest}"
-                if route["is_recommended"]
-                else f"{format_minutes(time_diff_vs_rec)} faster, but {abs(score_diff_vs_rec)} pts lower safety score"
-                if time_diff_vs_rec < 0
-                else f"+{format_minutes(time_diff_vs_rec)} slower and {abs(score_diff_vs_rec)} pts lower safety score"
-            ),
+            "is_fastest": is_fastest,
+            "tradeoff_headline": headline,
         }
 
     return sorted_routes

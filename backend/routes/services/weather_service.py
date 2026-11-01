@@ -61,7 +61,7 @@ def forecast_window(departure_time: datetime, routes: List[Dict[str, Any]]) -> T
     departure_utc = departure_time.astimezone(dt_timezone.utc)
     start = (departure_utc + timedelta(minutes=30)).replace(minute=0, second=0, microsecond=0)
     longest_hours = max(
-        (cp["elapsed_hours"] for route in routes for cp in route["checkpoints"]), default=0.0
+        (cp["elapsed_minutes"] / 60.0 for route in routes for cp in route["checkpoints"]), default=0.0
     )
     lead_hours = (departure_utc - start).total_seconds() / 3600.0
     hours = max(HEATMAP_HOURS, math.ceil(lead_hours + longest_hours) + 1)
@@ -71,7 +71,7 @@ def forecast_window(departure_time: datetime, routes: List[Dict[str, Any]]) -> T
 def eta_hour_index(departure_time: datetime, forecast_start: datetime, elapsed_hours: float) -> int:
     """Index into a series starting at `forecast_start` that is nearest to departure + elapsed."""
     lead_hours = (departure_time - forecast_start).total_seconds() / 3600.0
-    return max(0, int(round(lead_hours + elapsed_hours)))
+    return max(0, math.floor(lead_hours + elapsed_hours + 0.5))  # round half up
 
 
 # --------------------------------------------------------------------------------------------
@@ -341,7 +341,7 @@ def populate_routes_weather_and_heatmap(
         for cp in route["checkpoints"]:
             point = key(cp["lat"], cp["lng"])
             series = series_by_point[point]
-            idx = min(hours, eta_hour_index(departure_utc, start, cp["elapsed_hours"]))
+            idx = min(hours, eta_hour_index(departure_utc, start, cp["elapsed_minutes"] / 60.0))
             at_eta = series[idx]
             cp["weather"] = {**at_eta, "forecast_hour": idx, "source": source}
             cp["risk"] = evaluate_checkpoint_risk(

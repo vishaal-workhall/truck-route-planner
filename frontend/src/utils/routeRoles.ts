@@ -3,7 +3,7 @@ import type { RouteOption } from '../types/routing';
 export type RouteRole = 'safest' | 'fastest' | 'balanced';
 
 export const ROLE_COLOR: Record<RouteRole, string> = {
-  safest: '#146C43',
+  safest: '#6D28D9',
   fastest: '#1E3A5F',
   balanced: '#5C6B7A',
 };
