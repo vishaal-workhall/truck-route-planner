@@ -44,8 +44,8 @@ const TITLES: Record<AppView, string> = {
 
 export function App() {
   const [view, setView] = useState<AppView>('plan');
-  const [origin, setOrigin] = useState<string>('Chicago, IL');
-  const [destination, setDestination] = useState<string>('Denver, CO');
+  const [origin, setOrigin] = useState<string>('');
+  const [destination, setDestination] = useState<string>('');
   const [departureLocal, setDepartureLocal] = useState<string>(getDefaultDepartureLocal);
   const [loadWeightLbs, setLoadWeightLbs] = useState<number>(42000);
   const [samplingInterval, setSamplingInterval] = useState<SamplingInterval>(25);

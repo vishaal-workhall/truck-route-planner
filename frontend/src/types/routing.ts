@@ -245,3 +245,12 @@ export interface RoutePlanHistoryItem {
   weather_data_source: string;
   created_at: string;
 }
+
+export interface PlaceSuggestion {
+  /** Text placed in the input; the backend geocodes it back to this place. */
+  label: string;
+  name: string;
+  detail: string;
+  lat?: number;
+  lng?: number;
+}

@@ -3,6 +3,7 @@ import { ArrowsLeftRight } from '@phosphor-icons/react';
 import type { PresetScenario, SamplingInterval, TruckType, WeatherMode } from '../types/routing';
 import { TRUCK_OPTIONS } from '../utils/trucks';
 import { Button, controlClass, Field, Segmented } from './ui/controls';
+import { PlaceCombobox } from './ui/PlaceCombobox';
 
 interface PlanViewProps {
   origin: string;
@@ -66,30 +67,21 @@ export function PlanView(props: PlanViewProps) {
           <h2 className="text-sm font-semibold">Journey</h2>
         </div>
         <div className="space-y-3 px-4 py-4">
-          <datalist id="freight-hub-suggestions">
-            {props.hubs.map((hub) => (
-              <option key={hub} value={hub} />
-            ))}
-          </datalist>
           <Field
             label="Origin"
             htmlFor="origin-input"
             error={props.fieldErrors.origin?.[0]}
-            hint="City name, or a latitude, longitude pair."
+            hint="Start typing a city, or enter a latitude, longitude pair."
           >
-            <input
+            <PlaceCombobox
               id="origin-input"
               name="origin"
-              type="text"
-              list="freight-hub-suggestions"
               value={props.origin}
-              onChange={(event) => props.onOrigin(event.target.value)}
-              placeholder="Chicago, IL"
-              aria-invalid={Boolean(props.fieldErrors.origin)}
-              aria-describedby={
-                props.fieldErrors.origin ? 'origin-input-error' : 'origin-input-hint'
-              }
-              className={controlClass}
+              onChange={props.onOrigin}
+              placeholder="e.g. Minneapolis, MN"
+              hubs={props.hubs}
+              invalid={Boolean(props.fieldErrors.origin)}
+              describedBy={props.fieldErrors.origin ? 'origin-input-error' : 'origin-input-hint'}
             />
           </Field>
           <div className="flex justify-end">
@@ -107,19 +99,15 @@ export function PlanView(props: PlanViewProps) {
             htmlFor="destination-input"
             error={props.fieldErrors.destination?.[0]}
           >
-            <input
+            <PlaceCombobox
               id="destination-input"
               name="destination"
-              type="text"
-              list="freight-hub-suggestions"
               value={props.destination}
-              onChange={(event) => props.onDestination(event.target.value)}
-              placeholder="Denver, CO"
-              aria-invalid={Boolean(props.fieldErrors.destination)}
-              aria-describedby={
-                props.fieldErrors.destination ? 'destination-input-error' : undefined
-              }
-              className={controlClass}
+              onChange={props.onDestination}
+              placeholder="e.g. Omaha, NE"
+              hubs={props.hubs}
+              invalid={Boolean(props.fieldErrors.destination)}
+              describedBy={props.fieldErrors.destination ? 'destination-input-error' : undefined}
             />
           </Field>
           <Field

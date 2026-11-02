@@ -572,3 +572,53 @@ class GeocodeAndRoutingEdgeTests(TestCase):
             with mock.patch("routes.services.routing_service.requests.get", return_value=self._osrm(payload, code)):
                 with self.assertRaises(NoDrivableRoute):
                     fetch_three_routes(origin, destination)
+
+
+
+class PlaceSearchTests(TestCase):
+    def setUp(self):
+        cache.clear()
+
+    def _geocoder(self, results):
+        response = mock.Mock(status_code=200)
+        response.json.return_value = {"results": results}
+        return response
+
+    SPRINGFIELDS = [
+        {"name": "Springfield", "latitude": 37.21, "longitude": -93.29, "admin1": "Missouri", "country": "United States", "country_code": "US"},
+        {"name": "Springfield", "latitude": 39.80, "longitude": -89.64, "admin1": "Illinois", "country": "United States", "country_code": "US"},
+        {"name": "Pune", "latitude": 18.52, "longitude": 73.86, "admin1": "Maharashtra", "country": "India", "country_code": "IN"},
+    ]
+
+    def test_suggestion_labels_resolve_to_the_same_place(self):
+        from .services.routing_service import geocode_location, search_places
+
+        with mock.patch("routes.services.routing_service.requests.get", return_value=self._geocoder(self.SPRINGFIELDS)):
+            suggestions = search_places("Spring")
+            labels = [s["label"] for s in suggestions]
+            self.assertIn("Springfield, Illinois", labels)
+            self.assertIn("Pune, Maharashtra, India", labels)
+            for suggestion in suggestions:
+                place = geocode_location(suggestion["label"])
+                self.assertAlmostEqual(place["lat"], suggestion["lat"], places=2, msg=suggestion["label"])
+
+    def test_hubs_come_first_without_duplicates(self):
+        from .services.routing_service import search_places
+
+        chicago = {"name": "Chicago", "latitude": 41.85, "longitude": -87.65, "admin1": "Illinois", "country": "United States", "country_code": "US"}
+        with mock.patch("routes.services.routing_service.requests.get", return_value=self._geocoder([chicago])):
+            results = self.client.get(reverse("place-search"), {"q": "chic"}).json()["results"]
+        self.assertEqual([r["label"] for r in results], ["Chicago, IL"])
+
+    def test_short_queries_and_geocoder_outage_are_safe(self):
+        from .services.routing_service import search_places
+
+        self.assertEqual(search_places("c"), [])
+        with mock.patch("routes.services.routing_service.requests.get", side_effect=requests_exception()):
+            self.assertEqual([r["label"] for r in search_places("Denv")], ["Denver, CO"])
+
+
+def requests_exception():
+    import requests
+
+    return requests.ConnectionError("down")

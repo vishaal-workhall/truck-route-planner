@@ -3,6 +3,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 import requests
 from django.conf import settings
+from django.core.cache import cache
 
 # Curated US Freight Hubs for instant lookup & nearest-city checkpoint labeling
 FREIGHT_HUBS: Dict[str, Dict[str, Any]] = {
@@ -152,7 +153,7 @@ def geocode_location(query: str) -> Dict[str, Any]:
     country_code_hint = country_codes.get(region_hint.lower(), "")
     params: Dict[str, Any] = {
         "name": search_term,
-        "count": 8,
+        "count": 20,
         "language": "en",
         "format": "json",
     }
@@ -196,6 +197,69 @@ def geocode_location(query: str) -> Dict[str, Any]:
     raise ValueError(
         f"Could not resolve location '{query}'. Try a city such as 'Chicago, IL' or 'Denver, CO'."
     )
+
+
+PLACE_SEARCH_CACHE_SECONDS = 24 * 3600
+
+
+def search_places(query: str, limit: int = 8) -> List[Dict[str, Any]]:
+    """
+    Type-ahead suggestions: freight hubs whose name starts with the query, then Open-Meteo
+    geocoding matches. Each `label` is a string geocode_location() resolves to the same place.
+    """
+    q = query.strip()
+    if len(q) < 2:
+        return []
+    lower_q = q.lower()
+
+    suggestions: List[Dict[str, Any]] = []
+    for hub in FREIGHT_HUBS.values():
+        if hub["name"].lower().startswith(lower_q):
+            city, _, state = hub["name"].partition(", ")
+            suggestions.append(
+                {
+                    "label": hub["name"],
+                    "name": city,
+                    "detail": f"{state} · freight hub",
+                    "lat": hub["lat"],
+                    "lng": hub["lng"],
+                }
+            )
+
+    search_term = q.split(",")[0].strip()
+    cache_key = f"places:{search_term.lower()}"
+    remote = cache.get(cache_key)
+    if remote is None:
+        try:
+            resp = requests.get(
+                settings.OPEN_METEO_GEOCODE_URL,
+                params={"name": search_term, "count": 10, "language": "en", "format": "json"},
+                timeout=4.0,
+            )
+            remote = (resp.json().get("results") or []) if resp.status_code == 200 else []
+            cache.set(cache_key, remote, PLACE_SEARCH_CACHE_SECONDS)
+        except (requests.RequestException, ValueError):
+            remote = []
+
+    for place in remote:
+        lat, lng = float(place["latitude"]), float(place["longitude"])
+        # Skip places already offered as a freight hub (same city).
+        if any(haversine_miles(lat, lng, s["lat"], s["lng"]) < 15 for s in suggestions):
+            continue
+        admin1 = place.get("admin1") or ""
+        country = place.get("country") or place.get("country_code") or ""
+        is_us = place.get("country_code") == "US"
+        label_parts = [place["name"], admin1] + ([] if is_us else [country])
+        suggestions.append(
+            {
+                "label": ", ".join(part for part in label_parts if part),
+                "name": place["name"],
+                "detail": ", ".join(part for part in (admin1, country) if part),
+                "lat": lat,
+                "lng": lng,
+            }
+        )
+    return suggestions[:limit]
 
 
 def _extract_osrm_corridor_name(osrm_route: Dict[str, Any], index: int, default_label: str) -> str:

@@ -22,6 +22,7 @@ from .services.routing_service import (
     geocode_location,
     haversine_miles,
     sample_route_checkpoints,
+    search_places,
 )
 from .services.weather_service import WeatherUnavailable, populate_routes_weather_and_heatmap
 
@@ -139,6 +140,17 @@ class HealthAndRulesAPIView(APIView):
                 "hubs": [h["name"] for h in FREIGHT_HUBS.values()],
             }
         )
+
+
+class PlaceSearchAPIView(APIView):
+    """
+    GET /api/places/?q=spring
+    Type-ahead place suggestions for the origin and destination fields.
+    """
+
+    def get(self, request):
+        query = request.query_params.get("q", "")[:100]
+        return Response({"results": search_places(query)})
 
 
 class PlanRouteAPIView(APIView):

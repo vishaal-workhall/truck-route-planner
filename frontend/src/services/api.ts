@@ -1,4 +1,5 @@
 import type {
+  PlaceSuggestion,
   RoutePlanHistoryItem,
   RoutePlanResponse,
   RulesResponse,
@@ -73,4 +74,14 @@ export async function fetchRoutePlanById(
     throw new Error('Could not load saved route plan.');
   }
   return res.json();
+}
+
+export async function searchPlaces(
+  query: string,
+  signal?: AbortSignal
+): Promise<PlaceSuggestion[]> {
+  const res = await fetch(`${API_BASE}/places/?q=${encodeURIComponent(query)}`, { signal });
+  if (!res.ok) return [];
+  const data = await res.json();
+  return data.results || [];
 }
